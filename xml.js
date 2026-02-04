@@ -43,13 +43,19 @@ async function fetchContent(url) {
 
         let content = response.body;
 
-        // Auto-detect gzip magic number (1f 8b) or file extension
-        if (isGzip || (content.length > 2 && content[0] === 0x1f && content[1] === 0x8b)) {
+        // Check for GZIP magic number (1f 8b)
+        // We do NOT rely on the extension alone because 'got' might have already decompressed it
+        // based on the Content-Encoding header.
+        const hasGzipMagicNumber = content.length > 2 && content[0] === 0x1f && content[1] === 0x8b;
+
+        if (hasGzipMagicNumber) {
             console.log(`📦 Decompressing gzip: ${url}`);
             try {
                 content = await gunzip(content);
             } catch (err) {
                 console.error(`❌ Decompression failed for ${url}: ${err.message}`);
+                // Fallback: It might be that the check failed or something else. 
+                // If it fails, we return null, or we could try to return the raw buffer if it looks like text.
                 return null;
             }
         }
