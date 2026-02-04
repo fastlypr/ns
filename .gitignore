@@ -1,0 +1,11 @@
+node_modules/
+.DS_Store
+result/
+to scrape/
+*.log
+crawlbase_token.txt
+proxies.txt
+input.txt
+export_*.txt
+*.tmp
+history.db

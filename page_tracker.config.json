@@ -1,0 +1,48 @@
+{
+  "defaults": {
+    "timeoutMs": 30000,
+    "retryLimit": 2,
+    "maxPages": 10,
+    "sameHostOnly": true,
+    "keepQueryString": false,
+    "excludedExtensions": [
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".bmp",
+      ".webp",
+      ".pdf",
+      ".css",
+      ".js",
+      ".json",
+      ".svg",
+      ".ico"
+    ],
+    "excludePathRegex": [
+      "^/wp-",
+      "^/author/",
+      "^/category/",
+      "^/tag/",
+      "^/page/\\d+/?$",
+      "/page/\\d+/?$"
+    ]
+  },
+  "trackedPages": [
+    {
+      "name": "ceoweekly_business",
+      "type": "html",
+      "startUrl": "https://ceoweekly.com/business/",
+      "outputFileBase": "ceoweekly_rss",
+      "maxPages": 20,
+      "includePathRegex": [
+        "^/[^/]+/?$",
+        "^/business/[^/]+/?$"
+      ],
+      "excludePathRegex": [
+        "^/business/?$",
+        "^/business/page/\\d+/?$"
+      ]
+    }
+  ]
+}

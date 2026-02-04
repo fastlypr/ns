@@ -1,0 +1,923 @@
+import { gotScraping } from 'got-scraping';
+import { HttpProxyAgent, HttpsProxyAgent } from 'hpagent';
+import * as cheerio from 'cheerio';
+import readlineSync from 'readline-sync';
+import fs from 'fs';
+import path from 'path';
+import { runSitemapScraper, rescanSavedSitemaps, runBulkSitemapScraper } from './xml.js';
+import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus } from './db.js';
+
+// Configuration
+const TIMEOUT = 15000; // 15 seconds
+let CONCURRENCY_LIMIT = 20; // High concurrency for speed
+let PROXY_LIST = [];
+let CRAWLBASE_TOKEN = '';
+let PROXY_MODE = 'AUTO';
+
+/**
+ * Loads proxies from proxies.txt and Crawlbase token
+ */
+function loadProxies() {
+    // Load Crawlbase Token
+    const tokenPath = path.join(process.cwd(), 'crawlbase_token.txt');
+    if (fs.existsSync(tokenPath)) {
+        CRAWLBASE_TOKEN = fs.readFileSync(tokenPath, 'utf8').trim();
+        if (CRAWLBASE_TOKEN) console.log(`\n🔑 Crawlbase Token Loaded`);
+    }
+
+    const proxyPath = path.join(process.cwd(), 'proxies.txt');
+    if (fs.existsSync(proxyPath)) {
+        const content = fs.readFileSync(proxyPath, 'utf8');
+        PROXY_LIST = content.split('\n')
+            .map(line => line.trim())
+            .filter(line => line && !line.startsWith('#'))
+            .map(line => {
+                // Handle IP:PORT:USER:PASS format
+                const parts = line.split(':');
+                if (parts.length === 4) {
+                    return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+                }
+                // Handle standard IP:PORT
+                if (!line.startsWith('http')) {
+                    return `http://${line}`;
+                }
+                return line;
+            });
+        
+        if (PROXY_LIST.length > 0) {
+            console.log(`\n🛡️  Loaded ${PROXY_LIST.length} proxies from proxies.txt`);
+            // Auto-adjust concurrency: 5 threads per proxy, but at least 20
+            CONCURRENCY_LIMIT = Math.max(20, PROXY_LIST.length * 5);
+            console.log(`⚡ Speed adjusted: Concurrency set to ${CONCURRENCY_LIMIT}`);
+        }
+    }
+}
+
+/**
+ * Gets a proxy agent configuration for a random proxy.
+ */
+function getRandomProxyAgent() {
+    if (PROXY_LIST.length === 0) return undefined;
+    
+    const proxyUrl = PROXY_LIST[Math.floor(Math.random() * PROXY_LIST.length)];
+    // Normalize proxy URL
+    const formattedProxy = proxyUrl.startsWith('http') ? proxyUrl : `http://${proxyUrl}`;
+    
+    return {
+        http: new HttpProxyAgent({ proxy: formattedProxy }),
+        https: new HttpsProxyAgent({ proxy: formattedProxy })
+    };
+}
+
+class ProxyManager {
+    constructor() {
+        this.domainStrategies = new Map(); // domain -> 'DIRECT' | 'WEBSHARE' | 'CRAWLBASE'
+        this.domainStats = new Map();
+    }
+
+    getStrategy(url) {
+        try {
+            // Respect Global Proxy Mode
+            if (PROXY_MODE === 'DIRECT_ONLY') return 'DIRECT';
+            if (PROXY_MODE === 'WEBSHARE_ONLY') return 'WEBSHARE';
+            if (PROXY_MODE === 'CRAWLBASE_ONLY') return 'CRAWLBASE';
+
+            const domain = new URL(url).hostname.replace(/^www\./, '');
+            if (!this.domainStrategies.has(domain)) {
+                // Default Strategy Hierarchy: DIRECT -> WEBSHARE -> CRAWLBASE
+                this.domainStrategies.set(domain, 'DIRECT');
+            }
+            return this.domainStrategies.get(domain);
+        } catch (e) {
+            return 'DIRECT';
+        }
+    }
+
+    getAgent(url) {
+        const strategy = this.getStrategy(url);
+        
+        if (strategy === 'WEBSHARE') {
+            return getRandomProxyAgent();
+        } else if (strategy === 'CRAWLBASE' && CRAWLBASE_TOKEN) {
+             const proxyUrl = `http://${CRAWLBASE_TOKEN}@smartproxy.crawlbase.com:8012`;
+             return {
+                http: new HttpProxyAgent({ proxy: proxyUrl }),
+                https: new HttpsProxyAgent({ proxy: proxyUrl })
+            };
+        }
+        // DIRECT (undefined agent)
+        return undefined;
+    }
+
+    reportSuccess(url) {
+        try {
+            const domain = new URL(url).hostname.replace(/^www\./, '');
+            const stats = this.getStats(domain);
+            stats.successes++;
+            stats.consecutiveFailures = 0;
+        } catch (e) {}
+    }
+
+    reportFailure(url, statusCode) {
+        try {
+            // Disable auto-upgrade if mode is fixed
+            if (PROXY_MODE !== 'AUTO') return false;
+
+            const domain = new URL(url).hostname.replace(/^www\./, '');
+            const stats = this.getStats(domain);
+            stats.failures++;
+            stats.consecutiveFailures++;
+            
+            const currentStrategy = this.getStrategy(url);
+            
+            // Upgrade Logic: If > 2 consecutive failures or blocking status
+            if (stats.consecutiveFailures >= 2 || statusCode === 403 || statusCode === 429) {
+                if (currentStrategy === 'DIRECT') {
+                    if (PROXY_LIST.length > 0) {
+                        console.log(`\n⚠️  Blocking detected on ${domain}. Upgrading to WEBSHARE proxies.`);
+                        this.domainStrategies.set(domain, 'WEBSHARE');
+                        stats.consecutiveFailures = 0;
+                        return true; // Indicate upgrade happened (trigger retry)
+                    } else if (CRAWLBASE_TOKEN) {
+                        console.log(`\n⚠️  Blocking detected on ${domain}. Upgrading to CRAWLBASE.`);
+                        this.domainStrategies.set(domain, 'CRAWLBASE');
+                        stats.consecutiveFailures = 0;
+                        return true;
+                    }
+                } else if (currentStrategy === 'WEBSHARE') {
+                    if (CRAWLBASE_TOKEN) {
+                        console.log(`\n⚠️  Blocking detected on ${domain} (Webshare failed). Upgrading to CRAWLBASE.`);
+                        this.domainStrategies.set(domain, 'CRAWLBASE');
+                        stats.consecutiveFailures = 0;
+                        return true;
+                    }
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+    
+    getStats(domain) {
+        if (!this.domainStats.has(domain)) {
+            this.domainStats.set(domain, { successes: 0, failures: 0, consecutiveFailures: 0 });
+        }
+        return this.domainStats.get(domain);
+    }
+}
+
+const proxyManager = new ProxyManager();
+
+// Social Media Regex Patterns
+const SOCIAL_PATTERNS = {
+    instagram: /https?:\/\/(www\.)?instagram\.com\/[a-zA-Z0-9_.]+/i,
+    linkedin: /https?:\/\/(www\.)?linkedin\.com\/(in|company)\/[a-zA-Z0-9%-]+/i,
+    twitter: /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/i,
+    facebook: /https?:\/\/(www\.)?facebook\.com\/[a-zA-Z0-9.]+/i,
+    youtube: /https?:\/\/(www\.)?youtube\.com\/(channel|c|user|@)[a-zA-Z0-9_-]+/i,
+    tiktok: /https?:\/\/(www\.)?tiktok\.com\/@[a-zA-Z0-9_.]+/i,
+    pinterest: /https?:\/\/(www\.)?pinterest\.com\/[a-zA-Z0-9_]+/i,
+    github: /https?:\/\/(www\.)?github\.com\/[a-zA-Z0-9_-]+/i
+};
+
+/**
+ * Scrapes a single article URL for social media links.
+ * @param {string} url - The URL of the article to scrape.
+ * @returns {Promise<Object>} - Object containing { source_url, socials, error }.
+ */
+async function scrapeSocialLinks(url) {
+    if (!url) return { source_url: '', socials: [], error: 'Empty URL' };
+    
+    // Clean URL (remove trailing colons or whitespace)
+    url = url.trim().replace(/[:]+$/, '');
+    
+    // basic protocol check
+    if (!url.startsWith('http')) {
+        url = 'https://' + url;
+    }
+
+    // console.log(`\n🔍 Analyzing: ${url} ...`); // Reduced logging for bulk
+    
+    let attempts = 0;
+    const maxAttempts = 2; // Allow 1 retry for strategy upgrade
+
+    while (attempts < maxAttempts) {
+        attempts++;
+        try {
+            const agent = proxyManager.getAgent(url);
+            
+            // 'got-scraping' automatically manages headers, TLS fingerprints, and HTTP/2
+            const response = await gotScraping({
+                url: url,
+                timeout: { request: TIMEOUT },
+                retry: { limit: 1 }, // Reduced internal retry, we handle strategy retry
+                http2: false,
+                agent: agent
+            });
+
+            const html = response.body;
+            proxyManager.reportSuccess(url);
+
+            const $ = cheerio.load(html);
+        
+            // Check for Cloudflare/Anti-bot blocking pages
+            const pageTitle = $('title').text().toLowerCase();
+            if (pageTitle.includes('access denied') || 
+                pageTitle.includes('attention required') || 
+                pageTitle.includes('just a moment') ||
+                pageTitle.includes('security check')) {
+                throw new Error('Blocked by Cloudflare/Anti-bot');
+            }
+
+            const socials = [];
+            const uniqueLinks = new Set();
+
+            // Find all anchor tags with href attributes
+            $('a[href]').each((_, element) => {
+                const href = $(element).attr('href');
+                if (!href) return;
+
+                // Skip generic share links
+                if (href.includes('sharer.php') || href.includes('twitter.com/share') || href.includes('intent/tweet')) {
+                    return;
+                }
+
+                // Check against all patterns
+                for (const [platform, regex] of Object.entries(SOCIAL_PATTERNS)) {
+                    if (regex.test(href)) {
+                        try {
+                            const fullUrl = href.startsWith('http') ? href : new URL(href, url).href;
+                            const cleanUrlObj = new URL(fullUrl);
+                            const cleanHref = cleanUrlObj.origin + cleanUrlObj.pathname;
+                            
+                            // Normalize if Instagram, otherwise use cleanHref
+                            const normalizedHref = cleanHref;
+                            
+                            if (!uniqueLinks.has(normalizedHref)) {
+                                uniqueLinks.add(normalizedHref);
+                                socials.push({
+                                    platform: platform,
+                                    link: normalizedHref,
+                                    category: 'link'
+                                });
+                            }
+                        } catch (e) {
+                            // skip invalid urls
+                        }
+                    }
+                }
+            });
+
+            // 2. Scan text content for specific Instagram handles
+            
+            // Cleanup DOM to ensure clean text extraction
+            $('script, style, noscript, iframe, svg').remove();
+            
+            // Add whitespace to prevent concatenation (e.g. "credit @user" + "instagram" -> "@userinstagram")
+            $('br').replaceWith(' ');
+            $('div, p, h1, h2, h3, h4, h5, h6, li, span, a, strong, em, b, i').after(' '); 
+            
+            const bodyText = $('body').text().replace(/\s+/g, ' ');
+            
+            // Define patterns to capture
+            const instagramPatterns = [
+                /instagram\s+@([a-zA-Z0-9_.]+)/gi,
+                /(?:follow|following)\s+(?:us\s+on|on)?\s*instagram\s+@([a-zA-Z0-9_.]+)/gi,
+                /IG\s+@([a-zA-Z0-9_.]+)/gi
+            ];
+
+            // Define patterns to exclude (Credit lines)
+            // Matches: "credit @user", "credit: @user", "credit to @user", "credit instagram @user"
+            const creditRegex = /credit(?:s)?\s*(?::|to)?\s*(?:instagram\s+)?@([a-zA-Z0-9_.]+)/gi;
+            const excludedHandles = new Set();
+            
+            let cMatch;
+            while ((cMatch = creditRegex.exec(bodyText)) !== null) {
+                let h = cMatch[1];
+                if (h.endsWith('.')) h = h.slice(0, -1);
+                excludedHandles.add(h.toLowerCase());
+            }
+            
+            for (const pattern of instagramPatterns) {
+                let match;
+                // Reset regex state just in case
+                pattern.lastIndex = 0;
+                
+                while ((match = pattern.exec(bodyText)) !== null) {
+                    let handle = match[1];
+                    
+                    // Remove trailing period (end of sentence)
+                    if (handle.endsWith('.')) handle = handle.slice(0, -1);
+                    
+                    // Basic filtering
+                    if (handle.length < 2) continue;
+                    if (handle.includes('@')) continue; 
+                    
+                    // Check if this handle is in the exclusion list
+                    if (excludedHandles.has(handle.toLowerCase())) {
+                        continue;
+                    }
+
+                    // Construct and Normalize URL
+                    let cleanHref = `https://www.instagram.com/${handle}`;
+                    
+                    if (!uniqueLinks.has(cleanHref)) {
+                        uniqueLinks.add(cleanHref);
+                        socials.push({
+                            platform: 'instagram',
+                            link: cleanHref,
+                            category: 'text'
+                        });
+                    }
+                }
+            }
+
+            return { source_url: url, socials: socials, error: null };
+
+        } catch (error) {
+            let statusCode = error.response ? error.response.statusCode : 0;
+            const upgraded = proxyManager.reportFailure(url, statusCode);
+            
+            if (upgraded && attempts < maxAttempts) {
+                console.log(`   🔄 Retrying ${url} with new proxy strategy...`);
+                continue; // Retry loop with new agent
+            }
+
+            let errorMsg = error.message;
+            if (statusCode === 403) {
+                errorMsg = "Access Denied (403)";
+            }
+            // Return failure only if retries exhausted
+            if (attempts >= maxAttempts) {
+                 return { source_url: url, socials: [], error: errorMsg };
+            }
+        }
+    }
+    return { source_url: url, socials: [], error: 'Max attempts reached' };
+}
+
+/**
+ * Extracts the username from an Instagram URL.
+ */
+const extractUsername = (urlStr) => {
+    try {
+        if (!urlStr) return '';
+        const urlObj = new URL(urlStr.startsWith('http') ? urlStr : `https://${urlStr}`);
+        if (urlObj.hostname.includes('instagram.com')) {
+            const parts = urlObj.pathname.split('/').filter(p => p.length > 0);
+            if (parts.length > 0) {
+                return parts[0].toLowerCase();
+            }
+        }
+        return '';
+    } catch (e) {
+        return '';
+    }
+};
+
+/**
+ * Saves results to CSV files organized by domain and platform.
+ * Structure: /result/<Domain>/<Platform>.csv
+ */
+function saveResults(result) {
+    if (!result || !result.socials || result.socials.length === 0) return;
+
+    const resultDir = path.join(process.cwd(), 'result');
+    if (!fs.existsSync(resultDir)) fs.mkdirSync(resultDir);
+
+    // Format timestamp: "Feb 4" (User requested format)
+    // But user asked for "date feb 4". Let's stick to a standard readable format or exactly as asked.
+    // "date feb 4" implies something like "MMM D".
+    const now = new Date();
+    const month = now.toLocaleString('en-US', { month: 'short' });
+    const day = now.getDate();
+    const timestamp = `${month} ${day}`;
+
+    // Consolidated CSV Path
+    const allResultsPath = path.join(resultDir, 'all_results.csv');
+    if (!fs.existsSync(allResultsPath)) {
+        fs.writeFileSync(allResultsPath, 'Timestamp,Domain,Platform,Source URL,Social Link,Username,Category\n');
+    }
+
+    try {
+        const urlObj = new URL(result.source_url);
+        let domain = urlObj.hostname.replace(/^www\./, '');
+        
+        const domainDir = path.join(resultDir, domain);
+        if (!fs.existsSync(domainDir)) fs.mkdirSync(domainDir);
+        
+        result.socials.forEach(social => {
+            const platform = social.platform.toLowerCase();
+            const fileName = `${platform}.csv`;
+            const filePath = path.join(domainDir, fileName);
+            
+            // Check duplicates based on USERNAME (if Instagram) or Link
+            let existingUsernames = new Set();
+            let existingLinks = new Set();
+            
+            if (fs.existsSync(filePath)) {
+                const content = fs.readFileSync(filePath, 'utf8');
+                content.split('\n').forEach(line => {
+                    const parts = line.split(',');
+                    // Format changed to include Timestamp at the end or beginning?
+                    // User said: "save results with timestamp in csv file"
+                    // Existing header: Source URL,Social Link,Username,Category
+                    // We should append Timestamp column or prepend it.
+                    // Let's Append it to maintain backward compatibility if possible, or Prepend.
+                    // Actually, modifying existing structure might break 'removeLineFromFile' if we rely on it?
+                    // No, removeLineFromFile works on source files, not result files.
+                    
+                    // Let's assume we add it as the last column for minimal disruption, OR as first.
+                    // "like date feb 4"
+                    
+                    // Let's check where the link is. 
+                    // Old format: Source, Link, Username, Category
+                    // New format: Source, Link, Username, Category, Timestamp
+                    
+                    if (parts.length >= 2) {
+                        const link = parts[1].trim();
+                        existingLinks.add(link);
+                        
+                        if (parts.length >= 3 && parts[2].trim()) {
+                            existingUsernames.add(parts[2].trim().toLowerCase());
+                        } else if (platform === 'instagram') {
+                            const uname = extractUsername(link);
+                            if (uname) existingUsernames.add(uname);
+                        }
+                    }
+                });
+            } else {
+                fs.writeFileSync(filePath, 'Source URL,Social Link,Username,Category,Timestamp\n');
+            }
+            
+            let shouldSave = false;
+            let username = '';
+
+            if (platform === 'instagram') {
+                username = extractUsername(social.link);
+                if (username && !existingUsernames.has(username)) {
+                    shouldSave = true;
+                } else if (!username && !existingLinks.has(social.link)) {
+                    shouldSave = true;
+                }
+            } else {
+                if (!existingLinks.has(social.link)) {
+                    shouldSave = true;
+                }
+            }
+
+            if (shouldSave) {
+                const cleanSource = result.source_url.includes(',') ? `"${result.source_url}"` : result.source_url;
+                const cleanLink = social.link.includes(',') ? `"${social.link}"` : social.link;
+                const cleanUser = username;
+                const category = social.category || 'link';
+                
+                // 1. Save to Domain Specific File
+                fs.appendFileSync(filePath, `${cleanSource},${cleanLink},${cleanUser},${category},${timestamp}\n`);
+                console.log(`   💾 Saved to result/${domain}/${fileName}`);
+
+                // 2. Save to Consolidated File (Append Only)
+                // Header: Timestamp,Domain,Platform,Source URL,Social Link,Username,Category
+                const csvLine = `${timestamp},${domain},${platform},${cleanSource},${cleanLink},${cleanUser},${category}\n`;
+                fs.appendFileSync(allResultsPath, csvLine);
+            }
+        });
+
+    } catch (e) {
+        console.error(`   ❌ Error saving CSV: ${e.message}`);
+    }
+}
+
+/**
+ * Removes a specific URL from the source file.
+ */
+function removeLineFromFile(filePath, urlToRemove) {
+    if (!filePath || !fs.existsSync(filePath)) return;
+    try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const lines = content.split('\n');
+        const newLines = lines.filter(line => {
+            const trimmed = line.trim();
+            if (!trimmed) return true; // Keep empty lines?
+            
+            // Exact match
+            if (trimmed === urlToRemove.trim()) return false;
+            
+            // CSV check
+            if (trimmed.includes(',')) {
+                const parts = trimmed.split(',');
+                if (parts.some(p => p.trim() === urlToRemove.trim())) return false;
+            }
+            
+            return true;
+        });
+        
+        if (newLines.length < lines.length) {
+            // Check if file is now effectively empty (only whitespace)
+            const remainingContent = newLines.join('\n').trim();
+            if (!remainingContent) {
+                try {
+                    if (fs.existsSync(filePath)) {
+                        fs.unlinkSync(filePath);
+                        console.log(`🗑️  Deleted empty file: ${path.basename(filePath)}`);
+                    }
+                } catch (err) {
+                    console.error(`Error deleting file: ${err.message}`);
+                }
+            } else {
+                fs.writeFileSync(filePath, newLines.join('\n'));
+            }
+        }
+    } catch (e) {
+        console.error(`Error updating source file: ${e.message}`);
+    }
+}
+
+/**
+ * Main scraping runner with worker pool
+ */
+async function runScraper(urls, sourceFilePath = null, force = false) {
+    console.log(`\n🚀 Processing ${urls.length} URL(s) with parallel limit of ${CONCURRENCY_LIMIT}...`);
+
+    // Worker function to process a single URL
+    const processUrl = async (rawUrl) => {
+        if (!rawUrl.trim()) return;
+        
+        // Clean URL (remove trailing colons or whitespace)
+        let url = rawUrl.trim().replace(/[:]+$/, '');
+
+        // Add protocol if missing (for consistent DB checking)
+        if (!url.startsWith('http')) {
+            url = 'https://' + url;
+        }
+
+        // Check if already scraped (unless forced)
+        if (!force && urlExists(url)) {
+            console.log(`⏭️  Skipping (Already Scraped): ${url}`);
+            // Still remove from source file if it was already processed
+            if (sourceFilePath) {
+                removeLineFromFile(sourceFilePath, rawUrl);
+            }
+            return;
+        }
+        
+        const result = await scrapeSocialLinks(url);
+        
+        // Remove from file immediately after processing (success or fail)
+        if (sourceFilePath) {
+            removeLineFromFile(sourceFilePath, rawUrl);
+        }
+        
+        if (result.error) {
+            logScrapeResult(url, 'Failed', result.error);
+            console.log(`❌ Failed: ${url} (${result.error})`);
+            return;
+        }
+        
+        console.log(`\n----------------------------------------`);
+        console.log(`🔗 Source: ${result.source_url}`);
+        
+        if (result.socials.length > 0) {
+            logScrapeResult(url, 'Success', `Found ${result.socials.length} links`);
+            console.log(`✅ Found ${result.socials.length} social media links:`);
+            result.socials.forEach(item => {
+                console.log(`   - [${item.platform.toUpperCase()}] ${item.link}`);
+            });
+            
+            // Save to CSV immediately
+            saveResults(result);
+        } else {
+            logScrapeResult(url, 'No_Result', 'No social links found');
+            console.log('⚠️  No social media links found (Marked as No Result).');
+        }
+    };
+
+    // Use an atomic index instead of shifting from a copied array (Memory Optimization)
+    let currentIndex = 0;
+    const activeWorkers = [];
+
+    // Worker loop
+    const worker = async () => {
+        while (currentIndex < urls.length) {
+            const url = urls[currentIndex++];
+            if (url) await processUrl(url);
+        }
+    };
+
+    // Start initial workers (up to limit)
+    const numWorkers = Math.min(urls.length, CONCURRENCY_LIMIT);
+    for (let i = 0; i < numWorkers; i++) {
+        activeWorkers.push(worker());
+    }
+
+    await Promise.all(activeWorkers);
+    
+    console.log('\n========================================');
+}
+
+/**
+ * Interactive menu to retry URLs by domain
+ */
+async function retryByDomain() {
+    console.log('\nFetching Failed and No_Result URLs from database...');
+    const failedUrls = getUrlsByStatus('Failed');
+    const noResultUrls = getUrlsByStatus('No_Result');
+    const allUrls = [...failedUrls, ...noResultUrls];
+    
+    if (allUrls.length === 0) {
+        console.log('✅ No Failed or No_Result URLs found in database.');
+        return;
+    }
+
+    // Group by Domain
+    const domainMap = {};
+    allUrls.forEach(url => {
+        try {
+            const u = new URL(url.startsWith('http') ? url : `http://${url}`);
+            const domain = u.hostname.replace(/^www\./, '');
+            if (!domainMap[domain]) domainMap[domain] = [];
+            domainMap[domain].push(url);
+        } catch (e) {
+            // handle invalid urls
+        }
+    });
+
+    const domains = Object.keys(domainMap).sort();
+    
+    console.log('\nSelect a domain to retry:');
+    console.log(`0. All Domains (${allUrls.length} URLs)`);
+    domains.forEach((d, i) => {
+        console.log(`${i + 1}. ${d} (${domainMap[d].length} URLs)`);
+    });
+    console.log(`${domains.length + 1}. Cancel`);
+
+    const selectionStr = readlineSync.question('\n> ');
+    const selection = parseInt(selectionStr);
+    
+    if (isNaN(selection)) {
+        console.log('Invalid selection.');
+        return;
+    }
+
+    let urlsToRetry = [];
+    
+    if (selection === 0) {
+        urlsToRetry = allUrls;
+    } else if (selection > 0 && selection <= domains.length) {
+        const selectedDomain = domains[selection - 1];
+        urlsToRetry = domainMap[selectedDomain];
+        console.log(`\nSelected domain: ${selectedDomain}`);
+    } else {
+        console.log('Cancelled.');
+        return;
+    }
+
+    if (urlsToRetry.length > 0) {
+        console.log(`\nRetrying ${urlsToRetry.length} URLs (Force Mode)...`);
+        await runScraper(urlsToRetry, null, true);
+    }
+}
+
+async function main() {
+    console.log("========================================");
+    console.log("   Stealth Social Media Scraper (Ultimate)");
+    console.log("========================================");
+
+    loadProxies();
+
+    // Ask for Proxy Mode
+    console.log('\nProxy Configuration:');
+    console.log('1. Auto (Direct -> Webshare -> Crawlbase) [Default]');
+    console.log('2. Direct Only (No Proxies)');
+    console.log('3. Webshare Proxies Only');
+    console.log('4. Crawlbase Only');
+    
+    const proxyChoice = readlineSync.question('👉 Select Proxy Mode (1-4) [1]: ');
+    if (proxyChoice === '2') PROXY_MODE = 'DIRECT_ONLY';
+    else if (proxyChoice === '3') PROXY_MODE = 'WEBSHARE_ONLY';
+    else if (proxyChoice === '4') PROXY_MODE = 'CRAWLBASE_ONLY';
+    else PROXY_MODE = 'AUTO';
+    
+    console.log(`🔒 Proxy Mode set to: ${PROXY_MODE}`);
+
+    // Show History Count
+    try {
+        const historyCount = getHistoryCount();
+        console.log(`📊 Database History: ${historyCount} URLs processed`);
+    } catch (e) {
+        console.log(`⚠️  Database not ready: ${e.message}`);
+    }
+
+    // Ensure 'to scrape' folder exists
+    const toScrapeDir = path.join(process.cwd(), 'to scrape');
+    if (!fs.existsSync(toScrapeDir)) {
+        fs.mkdirSync(toScrapeDir);
+        console.log(`Created directory: ${toScrapeDir}`);
+    }
+
+    // Daemon Mode from Command Line (Backwards Compatibility)
+    const args = process.argv.slice(2);
+    if (args.includes('--daemon') || args.includes('--watch')) {
+        console.log('\n👻 Daemon Mode Activated via Flag');
+        await runDaemonMode(toScrapeDir);
+        return; // Exit main loop if daemon starts
+    }
+
+    while (true) {
+        console.log('\n========================================');
+        console.log('   MAIN MENU');
+        console.log('========================================');
+        console.log('1. 🚀 Scrape Articles');
+        console.log('2. 🗺️ Sitemap Tools');
+        console.log('3. 📊 Manage Results');
+        console.log('4. 👻 Start Daemon Mode');
+        console.log('5. ❌ Exit');
+        
+        const choice = readlineSync.question('\n👉 Choose an option (1-5): ');
+        
+        if (choice === '5' || choice.toLowerCase() === 'exit') {
+            console.log('Goodbye! 👋');
+            break;
+        }
+
+        let urls = [];
+        const toScrapeDir = path.join(process.cwd(), 'to scrape');
+
+        // --- OPTION 1: SCRAPE ARTICLES ---
+        if (choice === '1') {
+            console.log('\n--- 🚀 Scrape Articles ---');
+            console.log('1. Paste a single URL');
+            console.log('2. Paste multiple URLs (one per line)');
+            console.log('3. Scrape URLs from input.txt');
+            console.log('4. Process files from "to scrape" folder');
+            console.log('5. Back to Main Menu');
+
+            const subChoice = readlineSync.question('\n👉 Choice (1-5): ');
+
+            if (subChoice === '1') {
+                const url = readlineSync.question('Enter URL: ');
+                if (url) {
+                    await runScraper([url], null, false);
+                }
+            } else if (subChoice === '2') {
+                console.log('Enter URLs (end with empty line):');
+                const batchUrls = [];
+                while (true) {
+                    const u = readlineSync.question('> ');
+                    if (!u) break;
+                    batchUrls.push(u);
+                }
+                if (batchUrls.length > 0) {
+                    await runScraper(batchUrls, null, false);
+                }
+            } else if (subChoice === '3') {
+                const inputFile = path.join(process.cwd(), 'input.txt');
+                if (fs.existsSync(inputFile)) {
+                    const content = fs.readFileSync(inputFile, 'utf8');
+                    const fileUrls = content.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+                    if (fileUrls.length > 0) {
+                        await runScraper(fileUrls, inputFile, false);
+                    } else console.log('No valid URLs found in input.txt');
+                } else {
+                    console.log('input.txt not found!');
+                }
+            } else if (subChoice === '4') {
+                try {
+                    const files = fs.readdirSync(toScrapeDir).filter(f => f.endsWith('.txt') || f.endsWith('.csv'));
+                    if (files.length === 0) {
+                        console.log('No files found in "to scrape" folder.');
+                    } else {
+                        console.log(`Found ${files.length} files.`);
+                        for (const file of files) {
+                            const filePath = path.join(toScrapeDir, file);
+                            const content = fs.readFileSync(filePath, 'utf8');
+                            const extractedUrls = [];
+                            content.split('\n').forEach(line => {
+                                const trimmed = line.trim();
+                                if (trimmed && trimmed.startsWith('http')) extractedUrls.push(trimmed);
+                            });
+
+                            if (extractedUrls.length > 0) {
+                                console.log(`Processing ${file}...`);
+                                await runScraper(extractedUrls, filePath, false);
+                            } else {
+                                console.log(`Deleting empty file: ${file}`);
+                                fs.unlinkSync(filePath);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.error(`Error: ${e.message}`);
+                }
+            }
+        }
+
+        // --- OPTION 2: SITEMAP TOOLS ---
+        else if (choice === '2') {
+            console.log('\n--- 🗺️ Sitemap Tools ---');
+            console.log('1. Scan New XML Sitemap (Recursive)');
+            console.log('2. Bulk Scrape from sitemaps.txt');
+            console.log('3. Rescan Saved Sitemaps for New URLs');
+            console.log('4. Back to Main Menu');
+
+            const subChoice = readlineSync.question('\n👉 Choice (1-4): ');
+
+            if (subChoice === '1') {
+                await runSitemapScraper(null, runScraper);
+            } else if (subChoice === '2') {
+                await runBulkSitemapScraper();
+            } else if (subChoice === '3') {
+                await rescanSavedSitemaps(runScraper);
+            }
+        }
+
+        // --- OPTION 3: MANAGE RESULTS ---
+        else if (choice === '3') {
+            console.log('\n--- 📊 Manage Results ---');
+            console.log('1. Export URLs (Success/Failed/etc)');
+            console.log('2. Retry Failed & No Result URLs');
+            console.log('3. Back to Main Menu');
+
+            const subChoice = readlineSync.question('\n👉 Choice (1-3): ');
+
+            if (subChoice === '1') {
+                console.log('\n👉 Select Export Status:');
+                console.log('1. Success');
+                console.log('2. Failed');
+                console.log('3. No Result');
+                console.log('4. All');
+                
+                const exportChoice = readlineSync.question('Choice (1-4): ');
+                let status = '';
+                let filenameSuffix = '';
+
+                switch(exportChoice) {
+                    case '1': status = 'Success'; filenameSuffix = 'success'; break;
+                    case '2': status = 'Failed'; filenameSuffix = 'failed'; break;
+                    case '3': status = 'No_Result'; filenameSuffix = 'no_result'; break;
+                    case '4': status = 'All'; filenameSuffix = 'all'; break;
+                }
+
+                if (status) {
+                    const filename = `export_${filenameSuffix}_${Date.now()}.txt`;
+                    const count = exportUrlsByStatus(status, filename);
+                    if (count > 0) console.log(`✅ Exported ${count} URLs to ${filename}`);
+                    else console.log('⚠️  No URLs found with that status.');
+                }
+            } else if (subChoice === '2') {
+                await retryByDomain();
+            }
+        }
+
+        // --- OPTION 4: DAEMON MODE ---
+        else if (choice === '4') {
+            await runDaemonMode(toScrapeDir);
+        }
+    }
+}
+
+async function runDaemonMode(toScrapeDir) {
+    console.log('\n👻 Daemon Mode Activated');
+    console.log('   Watching "to scrape" folder for new files...');
+    
+    if (!fs.existsSync(toScrapeDir)) fs.mkdirSync(toScrapeDir);
+
+    while (true) {
+        try {
+            const files = fs.readdirSync(toScrapeDir).filter(f => f.endsWith('.txt') || f.endsWith('.csv'));
+            
+            if (files.length > 0) {
+                console.log(`\n📂 Found ${files.length} file(s). Processing...`);
+                for (const file of files) {
+                    const filePath = path.join(toScrapeDir, file);
+                    const content = fs.readFileSync(filePath, 'utf8');
+                    const extractedUrls = [];
+                    
+                    content.split('\n').forEach(line => {
+                        const trimmed = line.trim();
+                        if (trimmed && trimmed.startsWith('http')) extractedUrls.push(trimmed);
+                        else if (trimmed.includes(',')) {
+                            const parts = trimmed.split(',');
+                            const u = parts.find(p => p.trim().startsWith('http'));
+                            if (u) extractedUrls.push(u.trim());
+                        }
+                    });
+
+                    if (extractedUrls.length > 0) {
+                        // In Daemon mode, we usually don't force, unless logic requires it. 
+                        // But new files implies new requests.
+                        // However, if they are duplicates, we might want to skip?
+                        // Let's assume standard behavior (no force) but log it.
+                        await runScraper(extractedUrls, filePath, false);
+                    } else {
+                        fs.unlinkSync(filePath);
+                    }
+                }
+            }
+        } catch (e) {
+            console.error(`Daemon Error: ${e.message}`);
+        }
+        await new Promise(r => setTimeout(r, 30000));
+    }
+}
+
+main();
