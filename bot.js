@@ -10,7 +10,7 @@ import {
     initializeScraper
 } from './scraper.js';
 import { runSitemapScraper, runBulkSitemapScraper, rescanSavedSitemaps } from './xml.js';
-import { getHistoryCount, exportUrlsByStatus } from './db.js';
+import { getAllSitemaps, getHistoryCount, exportUrlsByStatus } from './db.js';
 
 // Utility function to escape MarkdownV2 special characters
 const escapeMarkdownV2 = (text) => {
@@ -162,6 +162,47 @@ const showFolderFilesMenu = async (chatId, folderName, message = null) => {
         message
     );
     return true;
+};
+
+const listSitemapDomains = () => {
+    const domains = new Set();
+
+    getAllSitemaps().forEach(url => {
+        try {
+            domains.add(new URL(url).hostname);
+        } catch (error) {
+            // Ignore invalid URLs saved in sitemap history.
+        }
+    });
+
+    return Array.from(domains).sort((a, b) => a.localeCompare(b));
+};
+
+const buildSitemapRescanKeyboard = () => {
+    const inlineKeyboard = [[
+        { text: '🌐 Rescan All', callback_data: 'sitemap_rescan_select:all' }
+    ]];
+
+    listSitemapDomains().forEach(domain => {
+        inlineKeyboard.push([
+            { text: `🗺️ ${domain}`, callback_data: `sitemap_rescan_select:${domain}` }
+        ]);
+    });
+
+    return { inline_keyboard: inlineKeyboard };
+};
+
+const runSitemapRescanFlow = async (chatId, targetDomain) => {
+    await withBotStatus('sitemap_rescan', `rescan:${targetDomain || 'all'}`, async () => {
+        if (targetDomain && targetDomain !== 'all') {
+            sendMessage(`*Rescanning saved sitemaps for:* ${escapeMarkdownV2(targetDomain)}...`, chatId);
+        } else {
+            sendMessage('*Rescanning ALL saved sitemaps...*', chatId);
+        }
+
+        await rescanSavedSitemaps(targetDomain === 'all' ? 'all' : targetDomain);
+        sendMessage('*Sitemap rescan complete!*', chatId);
+    });
 };
 
 const BOT_COMMANDS = [
@@ -366,6 +407,21 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
     }
 
+    if (data.startsWith('sitemap_rescan_select:')) {
+        const rawTarget = data.slice('sitemap_rescan_select:'.length);
+        const targetDomain = rawTarget === 'all' ? 'all' : path.basename(rawTarget);
+        const availableDomains = listSitemapDomains();
+
+        if (targetDomain !== 'all' && !availableDomains.includes(targetDomain)) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Domain is no longer available', show_alert: true });
+            return;
+        }
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await runSitemapRescanFlow(msg.chat.id, targetDomain);
+        return;
+    }
+
     if (data.startsWith('results_folder:')) {
         const folderName = path.basename(data.replace('results_folder:', ''));
         const rendered = await showFolderFilesMenu(msg.chat.id, folderName, msg);
@@ -455,16 +511,24 @@ bot.onText(/\/sitemap_rescan(?: (.+))?/, async (msg, match) => {
         bot.sendMessage(msg.chat.id, 'Unauthorized access.');
         return;
     }
-    const targetDomain = match[1]; // Can be undefined, a domain, or 'all'
-    await withBotStatus('sitemap_rescan', `rescan:${targetDomain || 'all'}`, async () => {
-        if (targetDomain) {
-            sendMessage(`*Rescanning saved sitemaps for:* ${escapeMarkdownV2(targetDomain)}...`);
-        } else {
-            sendMessage(`*Rescanning ALL saved sitemaps...*`);
-        }
-        await rescanSavedSitemaps(targetDomain);
-        sendMessage('*Sitemap rescan complete!*');
-    });
+    const targetDomain = match[1];
+
+    if (targetDomain) {
+        await runSitemapRescanFlow(msg.chat.id, targetDomain);
+        return;
+    }
+
+    const availableDomains = listSitemapDomains();
+    if (availableDomains.length === 0) {
+        sendMessage('No saved sitemaps found.', msg.chat.id);
+        return;
+    }
+
+    await sendOrEditMenu(
+        msg.chat.id,
+        'Select which sitemap group to rescan:',
+        buildSitemapRescanKeyboard()
+    );
 });
 
 bot.onText(/\/stats/, (msg) => {
