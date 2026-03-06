@@ -7,7 +7,9 @@ import {
     scrapeUrlsFromInputFile,
     processToScrapeFolder,
     retryFailedAndNoResultUrls,
-    initializeScraper
+    initializeScraper,
+    getProxyMode,
+    setProxyMode
 } from './scraper.js';
 import { runSitemapScraper, runBulkSitemapScraper, rescanSavedSitemaps } from './xml.js';
 import { getAllSitemaps, getHistoryCount, exportUrlsByStatus } from './db.js';
@@ -350,10 +352,42 @@ const buildSystemMenuKeyboard = () => ({
     inline_keyboard: [
         [{ text: '📡 Bot Status', callback_data: 'home_view:status' }],
         [{ text: '📈 Statistics', callback_data: 'home_view:stats' }],
+        [{ text: '🛡️ Proxy Mode', callback_data: 'home_open:proxy_mode' }],
         [{ text: '❓ Help', callback_data: 'home_view:help' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
 });
+
+const formatProxyModeLabel = (mode) => {
+    switch (mode) {
+        case 'DIRECT_ONLY':
+            return 'Direct Only';
+        case 'WEBSHARE_ONLY':
+            return 'Webshare Only';
+        case 'CRAWLBASE_ONLY':
+            return 'Crawlbase Only';
+        default:
+            return 'Auto';
+    }
+};
+
+const buildProxyModeKeyboard = () => {
+    const currentMode = getProxyMode();
+    const formatOption = (mode, label) => ({
+        text: `${currentMode === mode ? '✅' : '▫️'} ${label}`,
+        callback_data: `proxy_mode_set:${mode}`
+    });
+
+    return {
+        inline_keyboard: [
+            [formatOption('AUTO', 'Auto')],
+            [formatOption('DIRECT_ONLY', 'Direct Only')],
+            [formatOption('WEBSHARE_ONLY', 'Webshare Only')],
+            [formatOption('CRAWLBASE_ONLY', 'Crawlbase Only')],
+            [{ text: '⬅️ Back to System', callback_data: 'home_section:system' }]
+        ]
+    };
+};
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env variables.');
@@ -651,6 +685,32 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
     }
 
+    if (data === 'home_open:proxy_mode') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            `Choose proxy mode:\nCurrent: ${formatProxyModeLabel(getProxyMode())}`,
+            buildProxyModeKeyboard(),
+            msg
+        );
+        return;
+    }
+
+    if (data.startsWith('proxy_mode_set:')) {
+        const selectedMode = path.basename(data.split(':')[1] || '').toUpperCase();
+        const currentMode = setProxyMode(selectedMode);
+        await safeAnswerCallbackQuery(callbackQuery.id, {
+            text: `Proxy mode set to ${formatProxyModeLabel(currentMode)}`
+        });
+        await sendOrEditMenu(
+            msg.chat.id,
+            `Choose proxy mode:\nCurrent: ${formatProxyModeLabel(currentMode)}`,
+            buildProxyModeKeyboard(),
+            msg
+        );
+        return;
+    }
+
     if (data === 'home_view:status') {
         const status = getBotStatus();
         await safeAnswerCallbackQuery(callbackQuery.id);
@@ -659,7 +719,8 @@ bot.on('callback_query', async (callbackQuery) => {
             'Bot Status',
             [
                 `Status: ${status.status}`,
-                `Current Task: ${status.task || 'None'}`
+                `Current Task: ${status.task || 'None'}`,
+                `Proxy Mode: ${formatProxyModeLabel(getProxyMode())}`
             ],
             msg
         );

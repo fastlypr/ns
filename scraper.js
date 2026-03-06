@@ -14,6 +14,7 @@ let PROXY_LIST = [];
 let CRAWLBASE_TOKEN = '';
 let PROXY_MODE = 'AUTO';
 let scraperInitialized = false;
+const PROXY_MODE_FILE = path.join(process.cwd(), 'proxy_mode.txt');
 
 function normalizeProxyMode(mode) {
     const normalized = String(mode || '').trim().toUpperCase();
@@ -21,6 +22,26 @@ function normalizeProxyMode(mode) {
         return normalized;
     }
     return 'AUTO';
+}
+
+function loadSavedProxyMode() {
+    if (!fs.existsSync(PROXY_MODE_FILE)) {
+        return null;
+    }
+
+    try {
+        return normalizeProxyMode(fs.readFileSync(PROXY_MODE_FILE, 'utf8'));
+    } catch (error) {
+        return null;
+    }
+}
+
+function saveProxyMode(mode) {
+    try {
+        fs.writeFileSync(PROXY_MODE_FILE, `${normalizeProxyMode(mode)}\n`);
+    } catch (error) {
+        console.error(`Failed to save proxy mode: ${error.message}`);
+    }
 }
 
 /**
@@ -66,11 +87,25 @@ function loadProxies() {
  * Initializes scraper runtime settings once for non-interactive callers.
  */
 export function initializeScraper(options = {}) {
-    PROXY_MODE = normalizeProxyMode(options.proxyMode || PROXY_MODE);
+    PROXY_MODE = normalizeProxyMode(options.proxyMode || loadSavedProxyMode() || PROXY_MODE);
     if (!scraperInitialized) {
         loadProxies();
         scraperInitialized = true;
     }
+}
+
+export function getProxyMode() {
+    ensureScraperInitialized();
+    return PROXY_MODE;
+}
+
+export function setProxyMode(mode) {
+    PROXY_MODE = normalizeProxyMode(mode);
+    saveProxyMode(PROXY_MODE);
+    if (!scraperInitialized) {
+        initializeScraper({ proxyMode: PROXY_MODE });
+    }
+    return PROXY_MODE;
 }
 
 function ensureScraperInitialized() {
