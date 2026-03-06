@@ -144,11 +144,30 @@ function loadProcessedUrls() {
 /**
  * Rescans all saved sitemaps for new URLs.
  */
-export async function rescanSavedSitemaps(targetDomain = null) {
+export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
+    const { onProgress } = options;
+    const emitProgress = async (payload) => {
+        if (typeof onProgress === 'function') {
+            await onProgress(payload);
+        }
+    };
+
     const sitemaps = getAllSitemaps();
+    const summary = {
+        target: targetDomain && String(targetDomain).toLowerCase() !== 'all' ? targetDomain : 'all',
+        totalRootSitemaps: 0,
+        processedRootSitemaps: 0,
+        skippedRootSitemaps: 0,
+        uniqueSitemapsVisited: 0,
+        newUrlsFound: 0,
+        newUrlsSaved: 0,
+        filePath: null
+    };
+
     if (sitemaps.length === 0) {
         console.log("⚠️  No saved sitemaps found in database.");
-        return;
+        await emitProgress({ stage: 'complete', summary: { ...summary } });
+        return summary;
     }
 
     // Extract unique domains
@@ -158,14 +177,6 @@ export async function rescanSavedSitemaps(targetDomain = null) {
             const hostname = new URL(url).hostname;
             domains.add(hostname);
         } catch (e) {}
-    });
-    
-    const domainList = Array.from(domains).sort();
-    
-    console.log('\n👉 Select Domain to Rescan:');
-    console.log('0. All Domains');
-    domainList.forEach((domain, index) => {
-        console.log(`${index + 1}. ${domain}`);
     });
     
     let sitemapsToScan = [];
@@ -200,29 +211,61 @@ export async function rescanSavedSitemaps(targetDomain = null) {
             console.log(`\n🔄 Rescanning ALL ${sitemaps.length} saved sitemaps...`);
         } else if (choiceIndex > 0 && choiceIndex <= domainList.length) {
             const selectedDomain = domainList[choiceIndex - 1];
+            summary.target = selectedDomain;
             sitemapsToScan = sitemaps.filter(url => url.includes(selectedDomain));
             console.log(`\n🔄 Rescanning sitemaps for domain: ${selectedDomain} (${sitemapsToScan.length} found)...`);
         } else {
             console.log("❌ Invalid choice or cancelled.");
-            return;
+            await emitProgress({ stage: 'complete', summary: { ...summary } });
+            return summary;
         }
     }
+
+    summary.totalRootSitemaps = sitemapsToScan.length;
+
+    if (sitemapsToScan.length === 0) {
+        console.log("⚠️  No matching saved sitemaps found.");
+        await emitProgress({ stage: 'complete', summary: { ...summary } });
+        return summary;
+    }
+
+    await emitProgress({ stage: 'start', summary: { ...summary } });
     
     const allNewUrls = new Set();
     const visited = new Set();
     
     // We process them sequentially to be safe, or we could do concurrency.
     // Given sitemaps can be large, sequential or low concurrency is better.
-    for (const sitemapUrl of sitemapsToScan) {
+    for (let index = 0; index < sitemapsToScan.length; index++) {
+        const sitemapUrl = sitemapsToScan[index];
+
         // Skip if already processed in this session (e.g., was a child of a previous sitemap)
-        if (visited.has(sitemapUrl)) continue;
+        if (visited.has(sitemapUrl)) {
+            summary.skippedRootSitemaps++;
+            await emitProgress({
+                stage: 'progress',
+                currentIndex: index + 1,
+                currentSitemapUrl: sitemapUrl,
+                summary: { ...summary, uniqueSitemapsVisited: visited.size, newUrlsFound: allNewUrls.size }
+            });
+            continue;
+        }
 
         console.log(`\n🔎 Checking: ${sitemapUrl}`);
         const articleUrls = new Set();
+
+        await emitProgress({
+            stage: 'scanning',
+            currentIndex: index + 1,
+            currentSitemapUrl: sitemapUrl,
+            summary: { ...summary, uniqueSitemapsVisited: visited.size, newUrlsFound: allNewUrls.size }
+        });
         
         // Pass shared 'visited' set to prevent infinite loops and redundant scrapes
         await scrapeSitemapRecursive(sitemapUrl, visited, articleUrls);
         updateSitemapScanDate(sitemapUrl);
+        summary.processedRootSitemaps++;
+        summary.uniqueSitemapsVisited = visited.size;
         
         // Filter new ones
         for (const url of articleUrls) {
@@ -230,6 +273,14 @@ export async function rescanSavedSitemaps(targetDomain = null) {
                 allNewUrls.add(url);
             }
         }
+
+        summary.newUrlsFound = allNewUrls.size;
+        await emitProgress({
+            stage: 'progress',
+            currentIndex: index + 1,
+            currentSitemapUrl: sitemapUrl,
+            summary: { ...summary }
+        });
     }
 
     if (allNewUrls.size > 0) {
@@ -243,9 +294,14 @@ export async function rescanSavedSitemaps(targetDomain = null) {
 
         fs.writeFileSync(filePath, Array.from(allNewUrls).join('\n'));
         console.log(`\n� Saved new URLs to: to scrape/${filename}`);
+        summary.newUrlsSaved = allNewUrls.size;
+        summary.filePath = filePath;
     } else {
         console.log(`\n✅ No new URLs found in any sitemap.`);
     }
+
+    await emitProgress({ stage: 'complete', summary: { ...summary } });
+    return summary;
 }
 
 /**

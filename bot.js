@@ -194,14 +194,33 @@ const buildSitemapRescanKeyboard = () => {
 
 const runSitemapRescanFlow = async (chatId, targetDomain) => {
     await withBotStatus('sitemap_rescan', `rescan:${targetDomain || 'all'}`, async () => {
-        if (targetDomain && targetDomain !== 'all') {
-            await sendPlainMessage(`Rescanning saved sitemaps for: ${targetDomain}...`, chatId);
-        } else {
-            await sendPlainMessage('Rescanning ALL saved sitemaps...', chatId);
-        }
+        let trackerMessage = await sendPlainMessage('Starting sitemap rescan...', chatId);
+        let lastTrackerUpdateAt = 0;
 
-        await rescanSavedSitemaps(targetDomain === 'all' ? 'all' : targetDomain);
-        await sendPlainMessage('Sitemap rescan complete!', chatId);
+        const updateTracker = async (summary, currentSitemapUrl = '', force = false) => {
+            const now = Date.now();
+            if (!force && now - lastTrackerUpdateAt < 1500) {
+                return;
+            }
+
+            lastTrackerUpdateAt = now;
+            const trackerText = buildSitemapRescanProgressText(summary, currentSitemapUrl);
+
+            try {
+                await safeEditMessageText(chatId, trackerMessage.message_id, trackerText);
+            } catch (error) {
+                trackerMessage = await sendPlainMessage(trackerText, chatId);
+            }
+        };
+
+        const summary = await rescanSavedSitemaps(targetDomain === 'all' ? 'all' : targetDomain, {
+            onProgress: async ({ stage, summary: progressSummary, currentSitemapUrl }) => {
+                await updateTracker(progressSummary, currentSitemapUrl, stage === 'start' || stage === 'complete');
+            }
+        });
+
+        await updateTracker(summary, '', true);
+        await sendPlainMessage(buildSitemapRescanSummaryText(summary), chatId);
     });
 };
 
@@ -243,6 +262,58 @@ export const sendMessage = (text, chatId = TELEGRAM_CHAT_ID, parseMode = 'Markdo
 
 const sendPlainMessage = (text, chatId = TELEGRAM_CHAT_ID) => {
     return bot.sendMessage(chatId, text);
+};
+
+const safeEditMessageText = async (chatId, messageId, text) => {
+    try {
+        await bot.editMessageText(text, {
+            chat_id: chatId,
+            message_id: messageId
+        });
+    } catch (error) {
+        const description = error?.response?.body?.description || error?.message || '';
+        if (description.includes('message is not modified')) {
+            return;
+        }
+        throw error;
+    }
+};
+
+const buildSitemapRescanProgressText = (summary, currentSitemapUrl = '') => {
+    const targetLabel = summary.target === 'all' ? 'All' : summary.target;
+    const lines = [
+        'Sitemap rescan running',
+        `Target: ${targetLabel}`,
+        `Completed: ${summary.processedRootSitemaps}/${summary.totalRootSitemaps} root sitemaps`,
+        `Visited: ${summary.uniqueSitemapsVisited} sitemap files`,
+        `New URLs found: ${summary.newUrlsFound}`
+    ];
+
+    if (currentSitemapUrl) {
+        lines.push(`Current: ${currentSitemapUrl}`);
+    }
+
+    return lines.join('\n');
+};
+
+const buildSitemapRescanSummaryText = (summary) => {
+    const targetLabel = summary.target === 'all' ? 'All' : summary.target;
+    const lines = [
+        'Sitemap rescan complete',
+        `Target: ${targetLabel}`,
+        `Completed: ${summary.processedRootSitemaps}/${summary.totalRootSitemaps} root sitemaps`,
+        `Skipped: ${summary.skippedRootSitemaps}`,
+        `Visited: ${summary.uniqueSitemapsVisited} sitemap files`,
+        `New URLs found: ${summary.newUrlsFound}`
+    ];
+
+    if (summary.filePath) {
+        lines.push(`Saved file: ${path.basename(summary.filePath)}`);
+    } else {
+        lines.push('Saved file: none');
+    }
+
+    return lines.join('\n');
 };
 
 const withBotStatus = async (status, task, action) => {
