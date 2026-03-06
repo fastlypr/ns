@@ -175,17 +175,22 @@ const showScrapeFileSelectionMenu = async (chatId, message = null) => {
     await sendOrEditMenu(chatId, 'Select a file to scrape:', { inline_keyboard: inlineKeyboard }, message);
 };
 
-const showResultsRootMenu = async (chatId, message = null) => {
+const showResultsRootMenu = async (chatId, message = null, statusLine = '') => {
     const keyboard = buildResultsRootKeyboard();
     if (keyboard.inline_keyboard.length <= 1) {
         await sendOrEditMenu(chatId, 'No result or backup files are available yet.', undefined, message);
         return;
     }
 
-    await sendOrEditMenu(chatId, 'Select a result or backup file to download:', keyboard, message);
+    const lines = ['Select a result or backup file to download:'];
+    if (statusLine) {
+        lines.push(statusLine);
+    }
+
+    await sendOrEditMenu(chatId, lines.join('\n'), keyboard, message);
 };
 
-const showFolderFilesMenu = async (chatId, folderName, message = null) => {
+const showFolderFilesMenu = async (chatId, folderName, message = null, statusLine = '') => {
     const safeFolderName = path.basename(folderName || '');
     const files = listCsvFilesInFolder(safeFolderName);
 
@@ -193,9 +198,14 @@ const showFolderFilesMenu = async (chatId, folderName, message = null) => {
         return false;
     }
 
+    const lines = [`📁 ${safeFolderName}`, 'Select a CSV file to download:'];
+    if (statusLine) {
+        lines.push(statusLine);
+    }
+
     await sendOrEditMenu(
         chatId,
-        `📁 ${safeFolderName}\nSelect a CSV file to download:`,
+        lines.join('\n'),
         buildFolderFilesKeyboard(safeFolderName),
         message
     );
@@ -1037,7 +1047,14 @@ bot.on('callback_query', async (callbackQuery) => {
         }
 
         await safeAnswerCallbackQuery(callbackQuery.id);
-        await sendDocumentFile(msg.chat.id, allResultsPath, '📄 all_results.csv');
+        await showResultsRootMenu(msg.chat.id, msg, '⬇️ Preparing all_results.csv...');
+        try {
+            await sendDocumentFile(msg.chat.id, allResultsPath, '📄 all_results.csv');
+            await showResultsRootMenu(msg.chat.id, msg, '✅ all_results.csv sent');
+        } catch (error) {
+            console.error(`Failed to send all_results.csv: ${error.message}`);
+            await showResultsRootMenu(msg.chat.id, msg, '❌ Failed to send all_results.csv');
+        }
         return;
     }
 
@@ -1049,7 +1066,14 @@ bot.on('callback_query', async (callbackQuery) => {
         }
 
         await safeAnswerCallbackQuery(callbackQuery.id);
-        await sendDocumentFile(msg.chat.id, historyDbPath, '🗄️ history.db backup');
+        await showResultsRootMenu(msg.chat.id, msg, '⬇️ Preparing history.db backup...');
+        try {
+            await sendDocumentFile(msg.chat.id, historyDbPath, '🗄️ history.db backup');
+            await showResultsRootMenu(msg.chat.id, msg, '✅ history.db backup sent');
+        } catch (error) {
+            console.error(`Failed to send history.db backup: ${error.message}`);
+            await showResultsRootMenu(msg.chat.id, msg, '❌ Failed to send history.db backup');
+        }
         return;
     }
 
@@ -1106,7 +1130,14 @@ bot.on('callback_query', async (callbackQuery) => {
         }
 
         await safeAnswerCallbackQuery(callbackQuery.id);
-        await sendDocumentFile(msg.chat.id, filePath, `📄 ${folderName} / ${fileName}`);
+        await showFolderFilesMenu(msg.chat.id, folderName, msg, `⬇️ Preparing ${fileName}...`);
+        try {
+            await sendDocumentFile(msg.chat.id, filePath, `📄 ${folderName} / ${fileName}`);
+            await showFolderFilesMenu(msg.chat.id, folderName, msg, `✅ ${fileName} sent`);
+        } catch (error) {
+            console.error(`Failed to send ${folderName}/${fileName}: ${error.message}`);
+            await showFolderFilesMenu(msg.chat.id, folderName, msg, `❌ Failed to send ${fileName}`);
+        }
         return;
     }
 
