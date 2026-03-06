@@ -74,6 +74,10 @@ const buildResultsRootKeyboard = () => {
         ]);
     });
 
+    inlineKeyboard.push([
+        { text: '⬅️ Back to Home', callback_data: 'home_back' }
+    ]);
+
     return { inline_keyboard: inlineKeyboard };
 };
 
@@ -129,6 +133,34 @@ const sendOrEditMenu = async (chatId, text, replyMarkup, message = null) => {
     }
 
     await bot.sendMessage(chatId, text, { reply_markup: replyMarkup });
+};
+
+const showHomeMenu = async (chatId, message = null) => {
+    await sendOrEditMenu(chatId, 'Choose an action:', buildHomeMenuKeyboard(), message);
+};
+
+const showHomeInfoPage = async (chatId, title, lines, message = null) => {
+    await sendOrEditMenu(chatId, [title, '', ...lines].join('\n'), buildHomeBackKeyboard(), message);
+};
+
+const showScrapeFileSelectionMenu = async (chatId, message = null) => {
+    const toScrapeDir = path.join(process.cwd(), 'to scrape');
+    if (!fs.existsSync(toScrapeDir)) {
+        fs.mkdirSync(toScrapeDir);
+    }
+
+    const inlineKeyboard = fs.readdirSync(toScrapeDir)
+        .filter(f => f.endsWith('.txt') || f.endsWith('.csv'))
+        .map(f => [{ text: `📄 ${f}`, callback_data: `scrape_file_select:${f}` }]);
+
+    inlineKeyboard.push([{ text: '⬅️ Back to Home', callback_data: 'home_back' }]);
+
+    if (inlineKeyboard.length === 1) {
+        await sendOrEditMenu(chatId, 'No .txt or .csv files found in the "to scrape" folder.', buildHomeBackKeyboard(), message);
+        return;
+    }
+
+    await sendOrEditMenu(chatId, 'Select a file to scrape:', { inline_keyboard: inlineKeyboard }, message);
 };
 
 const showResultsRootMenu = async (chatId, message = null) => {
@@ -188,6 +220,10 @@ const buildSitemapRescanKeyboard = () => {
             { text: `🗺️ ${domain}`, callback_data: `sitemap_rescan_select:${domain}` }
         ]);
     });
+
+    inlineKeyboard.push([
+        { text: '⬅️ Back to Home', callback_data: 'home_back' }
+    ]);
 
     return { inline_keyboard: inlineKeyboard };
 };
@@ -267,6 +303,29 @@ const buildHelpMessage = () => [
     '💡 `/sitemap https://example.com/sitemap.xml`',
     '💡 `/export_urls Success`'
 ].join('\n');
+
+const buildHomeMenuKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '🔗 Scrape URL', callback_data: 'home_usage:scrape_url' }],
+        [{ text: '📄 Scrape File', callback_data: 'home_open:scrape_file' }],
+        [{ text: '📁 Scrape Folder', callback_data: 'home_action:scrape_folder' }],
+        [{ text: '🧭 Scan Sitemap URL', callback_data: 'home_usage:sitemap' }],
+        [{ text: '🌐 Sitemap Bulk', callback_data: 'home_action:sitemap_bulk' }],
+        [{ text: '🔄 Sitemap Rescan', callback_data: 'home_open:sitemap_rescan' }],
+        [{ text: '📂 Download Results', callback_data: 'home_open:download_results' }],
+        [{ text: '📤 Export URLs', callback_data: 'home_usage:export_urls' }],
+        [{ text: '📡 Bot Status', callback_data: 'home_view:status' }],
+        [{ text: '📈 Statistics', callback_data: 'home_view:stats' }],
+        [{ text: '♻️ Retry Failed', callback_data: 'home_action:retry_failed' }],
+        [{ text: '❓ Help', callback_data: 'home_view:help' }]
+    ]
+});
+
+const buildHomeBackKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
+    ]
+});
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env variables.');
@@ -445,7 +504,7 @@ bot.onText(/\/start/, (msg) => {
         bot.sendMessage(msg.chat.id, 'Unauthorized access.');
         return;
     }
-    bot.sendMessage(msg.chat.id, `Welcome to your Scraper Bot\\!\n\n${buildHelpMessage()}`, { parse_mode: 'MarkdownV2' });
+    showHomeMenu(msg.chat.id);
     // Set bot commands for better discoverability in Telegram UI
     bot.setMyCommands(BOT_COMMANDS).catch(error => {
         console.error(`Failed to set Telegram bot commands: ${error.message}`);
@@ -493,28 +552,7 @@ bot.onText(/\/scrape_file/, async (msg) => {
         bot.sendMessage(msg.chat.id, 'Unauthorized access.');
         return;
     }
-
-    const toScrapeDir = path.join(process.cwd(), 'to scrape');
-    if (!fs.existsSync(toScrapeDir)) {
-        fs.mkdirSync(toScrapeDir);
-    }
-
-    const files = fs.readdirSync(toScrapeDir)
-        .filter(f => f.endsWith('.txt') || f.endsWith('.csv'))
-        .map(f => ({ text: f, callback_data: `scrape_file_select:${f}` }));
-
-    if (files.length === 0) {
-        sendMessage('No .txt or .csv files found in the \'to scrape\' folder. Please add files there first.');
-        return;
-    }
-
-    const options = {
-        reply_markup: {
-            inline_keyboard: [files]
-        }
-    };
-
-    bot.sendMessage(msg.chat.id, 'Please select a file to scrape:', options);
+    await showScrapeFileSelectionMenu(msg.chat.id);
 });
 
 bot.on('callback_query', async (callbackQuery) => {
@@ -526,6 +564,147 @@ bot.on('callback_query', async (callbackQuery) => {
         await safeAnswerCallbackQuery(callbackQuery.id, {
             text: 'Unauthorized',
             show_alert: true
+        });
+        return;
+    }
+
+    if (data === 'home_back') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeMenu(msg.chat.id, msg);
+        return;
+    }
+
+    if (data === 'home_open:scrape_file') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showScrapeFileSelectionMenu(msg.chat.id, msg);
+        return;
+    }
+
+    if (data === 'home_open:download_results') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showResultsRootMenu(msg.chat.id, msg);
+        return;
+    }
+
+    if (data === 'home_open:sitemap_rescan') {
+        const availableDomains = listSitemapDomains();
+        await safeAnswerCallbackQuery(callbackQuery.id);
+
+        if (availableDomains.length === 0) {
+            await showHomeInfoPage(msg.chat.id, 'Sitemap Rescan', ['No saved sitemaps found.'], msg);
+            return;
+        }
+
+        await sendOrEditMenu(msg.chat.id, 'Select which sitemap group to rescan:', buildSitemapRescanKeyboard(), msg);
+        return;
+    }
+
+    if (data === 'home_view:status') {
+        const status = getBotStatus();
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Bot Status',
+            [
+                `Status: ${status.status}`,
+                `Current Task: ${status.task || 'None'}`
+            ],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_view:stats') {
+        const historyCount = getHistoryCount();
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Statistics',
+            [`Total URLs processed: ${historyCount}`],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_view:help') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Help',
+            [
+                'Use the Home buttons to open tools in one place.',
+                'You can still type /help for the full command list.',
+                'Use /scrape_url, /sitemap, and /export_urls when you need to pass values.'
+            ],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_usage:scrape_url') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Scrape URL',
+            ['Use:', '/scrape_url https://example.com/article'],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_usage:sitemap') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Scan Sitemap URL',
+            ['Use:', '/sitemap https://example.com/sitemap.xml'],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_usage:export_urls') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Export URLs',
+            ['Use:', '/export_urls Success', '/export_urls Failed', '/export_urls All'],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_action:scrape_folder') {
+        const toScrapeDir = path.join(process.cwd(), 'to scrape');
+        if (!fs.existsSync(toScrapeDir)) {
+            fs.mkdirSync(toScrapeDir);
+        }
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await withBotStatus('scraping', 'folder', async () => {
+            sendMessage(`*Processing files in folder:* ${escapeMarkdownV2(toScrapeDir)}`);
+            await processToScrapeFolder(toScrapeDir);
+            sendMessage('*Folder processing complete!*');
+        });
+        return;
+    }
+
+    if (data === 'home_action:sitemap_bulk') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await withBotStatus('sitemap_bulk', 'bulk_sitemap', async () => {
+            sendMessage('*Starting bulk sitemap scraping from sitemaps.txt...*');
+            await runBulkSitemapScraper();
+            sendMessage('*Bulk sitemap scraping complete!*');
+        });
+        return;
+    }
+
+    if (data === 'home_action:retry_failed') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await withBotStatus('retry', 'retry_failed', async () => {
+            sendMessage('*Retrying failed and no-result URLs...*');
+            await retryFailedAndNoResultUrls();
+            sendMessage('*Retry complete!*');
         });
         return;
     }
