@@ -7,13 +7,12 @@ import {
     scrapeUrlsFromInputFile,
     runScraper,
     processToScrapeFolder,
-    retryFailedAndNoResultUrls,
     initializeScraper,
     getProxyMode,
     setProxyMode
 } from './scraper.js';
 import { runSitemapScraper, runBulkSitemapScraper, rescanSavedSitemaps } from './xml.js';
-import { getAllSitemaps, getHistoryCount, exportUrlsByStatus } from './db.js';
+import { getAllSitemaps, getHistoryCount, exportUrlsByStatus, getUrlsByStatus } from './db.js';
 
 // Utility function to escape MarkdownV2 special characters
 const escapeMarkdownV2 = (text) => {
@@ -26,6 +25,21 @@ const escapeMarkdownV2 = (text) => {
 
 const formatHelpLine = (emoji, command, description) =>
     `${emoji} \`${command}\` ${escapeMarkdownV2(description)}`;
+
+const RETRY_OPTIONS = {
+    failed: {
+        statuses: ['Failed'],
+        label: 'Failed URLs'
+    },
+    no_result: {
+        statuses: ['No_Result'],
+        label: 'No Result URLs'
+    },
+    both: {
+        statuses: ['Failed', 'No_Result'],
+        label: 'Failed + No Result URLs'
+    }
+};
 
 const getResultDirPath = () => path.join(process.cwd(), 'result');
 
@@ -226,6 +240,68 @@ const listSitemapDomains = () => {
     return Array.from(domains).sort((a, b) => a.localeCompare(b));
 };
 
+const getRetryOption = (retryKey) => RETRY_OPTIONS[retryKey] || RETRY_OPTIONS.both;
+
+const collectRetryUrls = (retryKey, domain = 'all') => {
+    const retryOption = getRetryOption(retryKey);
+    const urls = Array.from(new Set(
+        retryOption.statuses.flatMap(status => getUrlsByStatus(status))
+    ));
+
+    if (domain === 'all') {
+        return urls;
+    }
+
+    return urls.filter(url => {
+        try {
+            return new URL(url).hostname === domain;
+        } catch (error) {
+            return false;
+        }
+    });
+};
+
+const listRetryDomains = (retryKey) => {
+    const domains = new Set();
+
+    collectRetryUrls(retryKey).forEach(url => {
+        try {
+            domains.add(new URL(url).hostname);
+        } catch (error) {
+            // Ignore invalid URLs in retry history.
+        }
+    });
+
+    return Array.from(domains).sort((a, b) => a.localeCompare(b));
+};
+
+const buildRetryTypeKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '❌ Failed', callback_data: 'retry_type:failed' }],
+        [{ text: '⚠️ No Result', callback_data: 'retry_type:no_result' }],
+        [{ text: '♻️ Failed + No Result', callback_data: 'retry_type:both' }],
+        [{ text: '⬅️ Back to Results', callback_data: 'home_section:results' }]
+    ]
+});
+
+const buildRetryDomainKeyboard = (retryKey) => {
+    const inlineKeyboard = [[
+        { text: '🌐 All Domains', callback_data: `retry_run:${retryKey}:all` }
+    ]];
+
+    listRetryDomains(retryKey).forEach(domain => {
+        inlineKeyboard.push([
+            { text: `🌍 ${domain}`, callback_data: `retry_run:${retryKey}:${encodeURIComponent(domain)}` }
+        ]);
+    });
+
+    inlineKeyboard.push([
+        { text: '⬅️ Back to Retry Types', callback_data: 'retry_back_types' }
+    ]);
+
+    return { inline_keyboard: inlineKeyboard };
+};
+
 const buildSitemapRescanKeyboard = () => {
     const inlineKeyboard = [[
         { text: '🌐 Rescan All', callback_data: 'sitemap_rescan_select:all' }
@@ -359,7 +435,7 @@ const buildResultsMenuKeyboard = () => ({
     inline_keyboard: [
         [{ text: '📂 Download Results', callback_data: 'home_open:download_results' }],
         [{ text: '📤 Export URLs', callback_data: 'home_usage:export_urls' }],
-        [{ text: '♻️ Retry Failed', callback_data: 'home_action:retry_failed' }],
+        [{ text: '♻️ Retry URLs', callback_data: 'home_open:retry_menu' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
 });
@@ -582,7 +658,7 @@ const runTrackedFileScrape = async (chatId, filePath) => {
     await sendPlainMessage(buildFileScrapeSummaryText(fileName, summary), chatId);
 };
 
-const runTrackedUrlListScrape = async (chatId, label, urls) => {
+const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
     let trackerMessage = await sendPlainMessage(`📄 ${label}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n🔗 -`, chatId);
     let lastTrackerUpdateAt = 0;
 
@@ -602,7 +678,7 @@ const runTrackedUrlListScrape = async (chatId, label, urls) => {
         }
     };
 
-    const summary = await runScraper(urls, null, false, {
+    const summary = await runScraper(urls, null, force, {
         onProgress: async (progress) => {
             await updateTracker(progress, progress.stage === 'start' || progress.stage === 'complete');
         }
@@ -873,6 +949,12 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
     }
 
+    if (data === 'home_open:retry_menu') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(msg.chat.id, 'Choose which URLs to retry:', buildRetryTypeKeyboard(), msg);
+        return;
+    }
+
     if (data === 'home_open:sitemap_rescan') {
         const availableDomains = listSitemapDomains();
         await safeAnswerCallbackQuery(callbackQuery.id);
@@ -988,6 +1070,64 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
     }
 
+    if (data === 'retry_back_types') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(msg.chat.id, 'Choose which URLs to retry:', buildRetryTypeKeyboard(), msg);
+        return;
+    }
+
+    if (data.startsWith('retry_type:')) {
+        const retryKey = path.basename(data.slice('retry_type:'.length));
+        const retryOption = getRetryOption(retryKey);
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+
+        if (collectRetryUrls(retryKey).length === 0) {
+            await sendOrEditMenu(msg.chat.id, `No ${retryOption.label.toLowerCase()} are available to retry.`, buildRetryTypeKeyboard(), msg);
+            return;
+        }
+
+        await sendOrEditMenu(
+            msg.chat.id,
+            `Choose domain for ${retryOption.label}:`,
+            buildRetryDomainKeyboard(retryKey),
+            msg
+        );
+        return;
+    }
+
+    if (data.startsWith('retry_run:')) {
+        const payload = data.slice('retry_run:'.length);
+        const separatorIndex = payload.indexOf(':');
+        const retryKey = separatorIndex === -1 ? 'both' : path.basename(payload.slice(0, separatorIndex));
+        const rawDomain = separatorIndex === -1 ? 'all' : payload.slice(separatorIndex + 1);
+        const domain = rawDomain === 'all' ? 'all' : path.basename(decodeURIComponent(rawDomain));
+        const retryOption = getRetryOption(retryKey);
+        const availableDomains = listRetryDomains(retryKey);
+
+        if (domain !== 'all' && !availableDomains.includes(domain)) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Domain is no longer available', show_alert: true });
+            return;
+        }
+
+        const urlsToRetry = collectRetryUrls(retryKey, domain);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+
+        if (urlsToRetry.length === 0) {
+            await sendOrEditMenu(msg.chat.id, 'No matching retry URLs found.', buildRetryTypeKeyboard(), msg);
+            return;
+        }
+
+        const retryLabel = domain === 'all'
+            ? `${retryOption.label} • All Domains`
+            : `${retryOption.label} • ${domain}`;
+
+        await withBotStatus('retry', `retry:${retryKey}:${domain}`, async () => {
+            await runTrackedUrlListScrape(msg.chat.id, retryLabel, urlsToRetry, true);
+        });
+        return;
+    }
+
     if (data === 'home_action:scrape_folder') {
         const toScrapeDir = path.join(process.cwd(), 'to scrape');
         if (!fs.existsSync(toScrapeDir)) {
@@ -1009,16 +1149,6 @@ bot.on('callback_query', async (callbackQuery) => {
             sendMessage('*Starting bulk sitemap scraping from sitemaps.txt...*');
             await runBulkSitemapScraper();
             sendMessage('*Bulk sitemap scraping complete!*');
-        });
-        return;
-    }
-
-    if (data === 'home_action:retry_failed') {
-        await safeAnswerCallbackQuery(callbackQuery.id);
-        await withBotStatus('retry', 'retry_failed', async () => {
-            sendMessage('*Retrying failed and no-result URLs...*');
-            await retryFailedAndNoResultUrls();
-            sendMessage('*Retry complete!*');
         });
         return;
     }
@@ -1256,11 +1386,7 @@ bot.onText(/\/retry_failed/, async (msg) => {
         bot.sendMessage(msg.chat.id, 'Unauthorized access.');
         return;
     }
-    await withBotStatus('retry', 'retry_failed', async () => {
-        sendMessage(`*Retrying failed and no-result URLs...*`);
-        await retryFailedAndNoResultUrls();
-        sendMessage('*Retry complete!*');
-    });
+    await sendOrEditMenu(msg.chat.id, 'Choose which URLs to retry:', buildRetryTypeKeyboard());
 });
 
 console.log('Telegram Bot started...');
