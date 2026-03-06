@@ -53,6 +53,23 @@ export function normalizeUrl(url) {
     return url.replace(/\/$/, '');
 }
 
+function normalizeStatus(status) {
+    const raw = String(status || '').trim();
+    const normalized = raw.toLowerCase().replace(/[-_\s]+/g, ' ').trim();
+
+    if (normalized === 'no result') {
+        return 'No_Result';
+    }
+    if (normalized === 'success') {
+        return 'Success';
+    }
+    if (normalized === 'failed') {
+        return 'Failed';
+    }
+    if (normalized === 'all') return 'All';
+    return raw;
+}
+
 /**
  * Checks if a URL has already been processed.
  * @param {string} url 
@@ -74,8 +91,9 @@ export function urlExists(url) {
 export function logScrapeResult(url, status, message, profileCount = 0) {
     if (!url) return;
     const normalized = normalizeUrl(url);
+    const normalizedStatus = normalizeStatus(status);
     try {
-        insertStmt.run(normalized, status, message, new Date().toISOString(), profileCount);
+        insertStmt.run(normalized, normalizedStatus || status, message, new Date().toISOString(), profileCount);
     } catch (err) {
         console.error(`Database Error (Log): ${err.message}`);
     }
@@ -94,14 +112,15 @@ export function getHistoryCount() {
  * @returns {Array<string>} - List of URLs.
  */
 export function getUrlsByStatus(status) {
+    const normalizedStatus = normalizeStatus(status);
     let stmt;
-    if (status === 'All') {
+    if (normalizedStatus === 'All') {
         stmt = db.prepare('SELECT url FROM scraped_urls');
         const rows = stmt.all();
         return rows.map(row => row.url);
     } else {
         stmt = db.prepare('SELECT url FROM scraped_urls WHERE status = ?');
-        const rows = stmt.all(status);
+        const rows = stmt.all(normalizedStatus);
         return rows.map(row => row.url);
     }
 }
@@ -111,13 +130,27 @@ export function getUrlsByStatus(status) {
  * @param {string} status - The status to export.
  * @param {string} filename - The output filename.
  */
-export function exportUrlsByStatus(status, filename) {
+export function exportUrlsByStatus(status) {
     const urls = getUrlsByStatus(status);
-    if (urls.length === 0) return 0;
+    const safeStatus = normalizeStatus(status) || String(status || '').trim();
+    if (urls.length === 0) {
+        console.log(`No URLs found for status: ${safeStatus}`);
+        return null;
+    }
     
-    const outputPath = path.join(process.cwd(), filename);
+    const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
+    const filename = `exported_urls_${safeStatus.toLowerCase().replace(/[^a-z0-9]+/g, '_')}_${timestamp}.txt`;
+    const outputPath = path.join(process.cwd(), 'result', filename);
+
+    // Ensure result directory exists
+    const resultDir = path.join(process.cwd(), 'result');
+    if (!fs.existsSync(resultDir)) {
+        fs.mkdirSync(resultDir);
+    }
+
     fs.writeFileSync(outputPath, urls.join('\n'));
-    return urls.length;
+    console.log(`✅ Exported ${urls.length} URLs with status '${safeStatus}' to ${outputPath}`);
+    return outputPath;
 }
 
 /**
@@ -194,7 +227,7 @@ export function migrateCsvToDb() {
 
             const timestamp = parts[0];
             let url = parts[1];
-            let status = parts[2];
+            let status = normalizeStatus(parts[2]);
             let message = parts.slice(3).join(','); // Join rest as message
 
             // Clean quotes if present
@@ -253,7 +286,13 @@ export function deduplicateUrls() {
                 // Priority: Success > No_Result > Failed
                 // Tie-breaker: Latest timestamp
                 group.sort((a, b) => {
-                    const statusScore = s => s === 'Success' ? 3 : (s === 'No_Result' ? 2 : 1);
+                    const statusScore = s => {
+                        const normalized = normalizeStatus(s);
+                        if (normalized === 'Success') return 3;
+                        if (normalized === 'No_Result') return 2;
+                        if (normalized === 'Failed') return 1;
+                        return 0;
+                    };
                     const scoreA = statusScore(a.status);
                     const scoreB = statusScore(b.status);
                     if (scoreA !== scoreB) return scoreB - scoreA;
@@ -268,7 +307,10 @@ export function deduplicateUrls() {
                 if (winner.url !== key) {
                      updates.push({
                          newUrl: key,
-                         data: winner,
+                         data: {
+                             ...winner,
+                             status: normalizeStatus(winner.status)
+                         },
                          oldUrl: winner.url
                      });
                 }
@@ -278,7 +320,10 @@ export function deduplicateUrls() {
                 if (row.url !== key) {
                     updates.push({
                          newUrl: key,
-                         data: row,
+                         data: {
+                             ...row,
+                             status: normalizeStatus(row.status)
+                         },
                          oldUrl: row.url
                      });
                 }

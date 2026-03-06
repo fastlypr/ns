@@ -4,7 +4,7 @@ import * as cheerio from 'cheerio';
 import readlineSync from 'readline-sync';
 import fs from 'fs';
 import path from 'path';
-import { runSitemapScraper, rescanSavedSitemaps, runBulkSitemapScraper } from './xml.js';
+import { runSitemapScraper, rescanSavedSitemaps, runBulkSitemapScraper, runSitemapScraperCLI } from './xml.js';
 import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus } from './db.js';
 
 // Configuration
@@ -13,6 +13,15 @@ let CONCURRENCY_LIMIT = 20; // High concurrency for speed
 let PROXY_LIST = [];
 let CRAWLBASE_TOKEN = '';
 let PROXY_MODE = 'AUTO';
+let scraperInitialized = false;
+
+function normalizeProxyMode(mode) {
+    const normalized = String(mode || '').trim().toUpperCase();
+    if (normalized === 'DIRECT_ONLY' || normalized === 'WEBSHARE_ONLY' || normalized === 'CRAWLBASE_ONLY' || normalized === 'AUTO') {
+        return normalized;
+    }
+    return 'AUTO';
+}
 
 /**
  * Loads proxies from proxies.txt and Crawlbase token
@@ -50,6 +59,23 @@ function loadProxies() {
             CONCURRENCY_LIMIT = Math.max(20, PROXY_LIST.length * 5);
             console.log(`⚡ Speed adjusted: Concurrency set to ${CONCURRENCY_LIMIT}`);
         }
+    }
+}
+
+/**
+ * Initializes scraper runtime settings once for non-interactive callers.
+ */
+export function initializeScraper(options = {}) {
+    PROXY_MODE = normalizeProxyMode(options.proxyMode || PROXY_MODE);
+    if (!scraperInitialized) {
+        loadProxies();
+        scraperInitialized = true;
+    }
+}
+
+function ensureScraperInitialized() {
+    if (!scraperInitialized) {
+        initializeScraper();
     }
 }
 
@@ -535,7 +561,9 @@ function removeLineFromFile(filePath, urlToRemove) {
 /**
  * Main scraping runner with worker pool
  */
-async function runScraper(urls, sourceFilePath = null, force = false) {
+export async function runScraper(urls, sourceFilePath = null, force = false) {
+    ensureScraperInitialized();
+
     console.log(`\n🚀 Processing ${urls.length} URL(s) with parallel limit of ${CONCURRENCY_LIMIT}...`);
 
     // Worker function to process a single URL
@@ -615,65 +643,93 @@ async function runScraper(urls, sourceFilePath = null, force = false) {
 }
 
 /**
- * Interactive menu to retry URLs by domain
+ * Scrapes a single URL and logs the result.
+ * This is an exported function for external use (e.g., Telegram bot).
+ * @param {string} url - The URL to scrape.
  */
-async function retryByDomain() {
-    console.log('\nFetching Failed and No_Result URLs from database...');
+export async function scrapeSingleUrlAndProcess(url) {
+    if (!url) {
+        console.log("No URL provided for single scrape.");
+        return;
+    }
+    await runScraper([url], null, false);
+}
+
+/**
+ * Scrapes URLs from a specified input file (e.g., input.txt).
+ * This is an exported function for external use (e.g., Telegram bot).
+ * @param {string} filePath - The path to the input file containing URLs.
+ */
+export async function scrapeUrlsFromInputFile(filePath) {
+    if (!fs.existsSync(filePath)) {
+        console.log(`Error: Input file not found at ${filePath}`);
+        return;
+    }
+
+    const content = fs.readFileSync(filePath, 'utf8');
+    const fileUrls = content.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+    if (fileUrls.length > 0) {
+        console.log(`Processing ${fileUrls.length} URLs from ${filePath}...`);
+        await runScraper(fileUrls, filePath, false);
+    } else {
+        console.log(`No valid URLs found in ${filePath}`);
+    }
+}
+
+/**
+ * Processes all text/csv files in the 'to scrape' folder.
+ * This is an exported function for external use (e.g., Telegram bot).
+ * @param {string} toScrapeDir - The path to the 'to scrape' directory.
+ */
+export async function processToScrapeFolder(toScrapeDir) {
+    try {
+        const files = fs.readdirSync(toScrapeDir).filter(f => f.endsWith('.txt') || f.endsWith('.csv'));
+        if (files.length === 0) {
+            console.log('No files found in "to scrape" folder.');
+            return;
+        }
+
+        console.log(`Found ${files.length} files in "to scrape" folder.`);
+        for (const file of files) {
+            const filePath = path.join(toScrapeDir, file);
+            const content = fs.readFileSync(filePath, 'utf8');
+            const extractedUrls = [];
+            content.split('\n').forEach(line => {
+                const trimmed = line.trim();
+                if (trimmed && trimmed.startsWith('http')) extractedUrls.push(trimmed);
+            });
+
+            if (extractedUrls.length > 0) {
+                // In Daemon mode, we usually don't force, unless logic requires it. 
+                // But new files implies new requests.
+                // However, if they are duplicates, we might want to skip?
+                // Let's assume standard behavior (no force) but log it.
+                await runScraper(extractedUrls, filePath, false);
+            } else {
+                console.log(`Deleting empty file: ${file}`);
+                fs.unlinkSync(filePath);
+            }
+        }
+    } catch (e) {
+        console.error(`Error processing 'to scrape' folder: ${e.message}`);
+    }
+}
+
+/**
+ * Retries URLs that previously failed or had no result.
+ * This is an exported function for external use (e.g., Telegram bot).
+ */
+export async function retryFailedAndNoResultUrls() {
     const failedUrls = getUrlsByStatus('Failed');
     const noResultUrls = getUrlsByStatus('No_Result');
-    const allUrls = [...failedUrls, ...noResultUrls];
-    
-    if (allUrls.length === 0) {
-        console.log('✅ No Failed or No_Result URLs found in database.');
-        return;
-    }
-
-    // Group by Domain
-    const domainMap = {};
-    allUrls.forEach(url => {
-        try {
-            const u = new URL(url.startsWith('http') ? url : `http://${url}`);
-            const domain = u.hostname.replace(/^www\./, '');
-            if (!domainMap[domain]) domainMap[domain] = [];
-            domainMap[domain].push(url);
-        } catch (e) {
-            // handle invalid urls
-        }
-    });
-
-    const domains = Object.keys(domainMap).sort();
-    
-    console.log('\nSelect a domain to retry:');
-    console.log(`0. All Domains (${allUrls.length} URLs)`);
-    domains.forEach((d, i) => {
-        console.log(`${i + 1}. ${d} (${domainMap[d].length} URLs)`);
-    });
-    console.log(`${domains.length + 1}. Cancel`);
-
-    const selectionStr = readlineSync.question('\n> ');
-    const selection = parseInt(selectionStr);
-    
-    if (isNaN(selection)) {
-        console.log('Invalid selection.');
-        return;
-    }
-
-    let urlsToRetry = [];
-    
-    if (selection === 0) {
-        urlsToRetry = allUrls;
-    } else if (selection > 0 && selection <= domains.length) {
-        const selectedDomain = domains[selection - 1];
-        urlsToRetry = domainMap[selectedDomain];
-        console.log(`\nSelected domain: ${selectedDomain}`);
-    } else {
-        console.log('Cancelled.');
-        return;
-    }
+    const urlsToRetry = [...new Set([...failedUrls, ...noResultUrls])];
 
     if (urlsToRetry.length > 0) {
-        console.log(`\nRetrying ${urlsToRetry.length} URLs (Force Mode)...`);
-        await runScraper(urlsToRetry, null, true);
+        console.log(`\nRetrying ${urlsToRetry.length} Failed & No Result URLs...`);
+        await runScraper(urlsToRetry, null, true); // Force retry
+    } else {
+        console.log('No failed or no-result URLs to retry.');
     }
 }
 
@@ -681,8 +737,6 @@ async function main() {
     console.log("========================================");
     console.log("   Stealth Social Media Scraper (Ultimate)");
     console.log("========================================");
-
-    loadProxies();
 
     // Ask for Proxy Mode
     console.log('\nProxy Configuration:');
@@ -696,6 +750,8 @@ async function main() {
     else if (proxyChoice === '3') PROXY_MODE = 'WEBSHARE_ONLY';
     else if (proxyChoice === '4') PROXY_MODE = 'CRAWLBASE_ONLY';
     else PROXY_MODE = 'AUTO';
+
+    initializeScraper({ proxyMode: PROXY_MODE });
     
     console.log(`🔒 Proxy Mode set to: ${PROXY_MODE}`);
 
@@ -756,7 +812,7 @@ async function main() {
             if (subChoice === '1') {
                 const url = readlineSync.question('Enter URL: ');
                 if (url) {
-                    await runScraper([url], null, false);
+                    await scrapeSingleUrlAndProcess(url);
                 }
             } else if (subChoice === '2') {
                 console.log('Enter URLs (end with empty line):');
@@ -771,43 +827,9 @@ async function main() {
                 }
             } else if (subChoice === '3') {
                 const inputFile = path.join(process.cwd(), 'input.txt');
-                if (fs.existsSync(inputFile)) {
-                    const content = fs.readFileSync(inputFile, 'utf8');
-                    const fileUrls = content.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-                    if (fileUrls.length > 0) {
-                        await runScraper(fileUrls, inputFile, false);
-                    } else console.log('No valid URLs found in input.txt');
-                } else {
-                    console.log('input.txt not found!');
-                }
+                await scrapeUrlsFromInputFile(inputFile);
             } else if (subChoice === '4') {
-                try {
-                    const files = fs.readdirSync(toScrapeDir).filter(f => f.endsWith('.txt') || f.endsWith('.csv'));
-                    if (files.length === 0) {
-                        console.log('No files found in "to scrape" folder.');
-                    } else {
-                        console.log(`Found ${files.length} files.`);
-                        for (const file of files) {
-                            const filePath = path.join(toScrapeDir, file);
-                            const content = fs.readFileSync(filePath, 'utf8');
-                            const extractedUrls = [];
-                            content.split('\n').forEach(line => {
-                                const trimmed = line.trim();
-                                if (trimmed && trimmed.startsWith('http')) extractedUrls.push(trimmed);
-                            });
-
-                            if (extractedUrls.length > 0) {
-                                console.log(`Processing ${file}...`);
-                                await runScraper(extractedUrls, filePath, false);
-                            } else {
-                                console.log(`Deleting empty file: ${file}`);
-                                fs.unlinkSync(filePath);
-                            }
-                        }
-                    }
-                } catch (e) {
-                    console.error(`Error: ${e.message}`);
-                }
+                await processToScrapeFolder(toScrapeDir);
             }
         }
 
@@ -822,11 +844,11 @@ async function main() {
             const subChoice = readlineSync.question('\n👉 Choice (1-4): ');
 
             if (subChoice === '1') {
-                await runSitemapScraper(null, runScraper);
+                await runSitemapScraperCLI();
             } else if (subChoice === '2') {
                 await runBulkSitemapScraper();
             } else if (subChoice === '3') {
-                await rescanSavedSitemaps(runScraper);
+                await rescanSavedSitemaps();
             }
         }
 
@@ -848,23 +870,23 @@ async function main() {
                 
                 const exportChoice = readlineSync.question('Choice (1-4): ');
                 let status = '';
-                let filenameSuffix = '';
 
                 switch(exportChoice) {
-                    case '1': status = 'Success'; filenameSuffix = 'success'; break;
-                    case '2': status = 'Failed'; filenameSuffix = 'failed'; break;
-                    case '3': status = 'No_Result'; filenameSuffix = 'no_result'; break;
-                    case '4': status = 'All'; filenameSuffix = 'all'; break;
+                    case '1': status = 'Success'; break;
+                    case '2': status = 'Failed'; break;
+                    case '3': status = 'No Result'; break;
+                    case '4': status = 'All'; break;
+                    default: console.log('Invalid choice.'); break;
                 }
 
                 if (status) {
-                    const filename = `export_${filenameSuffix}_${Date.now()}.txt`;
-                    const count = exportUrlsByStatus(status, filename);
-                    if (count > 0) console.log(`✅ Exported ${count} URLs to ${filename}`);
-                    else console.log('⚠️  No URLs found with that status.');
+                    const exportedFilePath = exportUrlsByStatus(status);
+                    if (exportedFilePath) {
+                        console.log(`Exported to: ${exportedFilePath}`);
+                    }
                 }
             } else if (subChoice === '2') {
-                await retryByDomain();
+                await retryFailedAndNoResultUrls();
             }
         }
 
@@ -920,4 +942,7 @@ async function runDaemonMode(toScrapeDir) {
     }
 }
 
-main();
+import { fileURLToPath } from 'url';
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    main();
+}

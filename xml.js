@@ -144,7 +144,7 @@ function loadProcessedUrls() {
 /**
  * Rescans all saved sitemaps for new URLs.
  */
-export async function rescanSavedSitemaps() {
+export async function rescanSavedSitemaps(targetDomain = null) {
     const sitemaps = getAllSitemaps();
     if (sitemaps.length === 0) {
         console.log("⚠️  No saved sitemaps found in database.");
@@ -168,26 +168,44 @@ export async function rescanSavedSitemaps() {
         console.log(`${index + 1}. ${domain}`);
     });
     
-    let choiceIndex = -1;
-    try {
-        const input = readlineSync.question(`\nChoice (0-${domainList.length}): `);
-        choiceIndex = parseInt(input, 10);
-    } catch(e) {
-        choiceIndex = -1;
-    }
-
     let sitemapsToScan = [];
     
-    if (choiceIndex === 0) {
-        sitemapsToScan = sitemaps;
-        console.log(`\n🔄 Rescanning ALL ${sitemaps.length} saved sitemaps...`);
-    } else if (choiceIndex > 0 && choiceIndex <= domainList.length) {
-        const selectedDomain = domainList[choiceIndex - 1];
-        sitemapsToScan = sitemaps.filter(url => url.includes(selectedDomain));
-        console.log(`\n🔄 Rescanning sitemaps for domain: ${selectedDomain} (${sitemapsToScan.length} found)...`);
+    if (targetDomain) {
+        if (targetDomain.toLowerCase() === 'all') {
+            sitemapsToScan = sitemaps;
+            console.log(`\n🔄 Rescanning ALL ${sitemaps.length} saved sitemaps (via argument)...`);
+        } else {
+            sitemapsToScan = sitemaps.filter(url => url.includes(targetDomain));
+            console.log(`\n🔄 Rescanning sitemaps for domain: ${targetDomain} (${sitemapsToScan.length} found) (via argument)...`);
+        }
     } else {
-        console.log("❌ Invalid choice or cancelled.");
-        return;
+        const domainList = Array.from(domains).sort();
+        
+        console.log('\n👉 Select Domain to Rescan:');
+        console.log('0. All Domains');
+        domainList.forEach((domain, index) => {
+            console.log(`${index + 1}. ${domain}`);
+        });
+        
+        let choiceIndex = -1;
+        try {
+            const input = readlineSync.question(`\nChoice (0-${domainList.length}): `);
+            choiceIndex = parseInt(input, 10);
+        } catch(e) {
+            choiceIndex = -1;
+        }
+
+        if (choiceIndex === 0) {
+            sitemapsToScan = sitemaps;
+            console.log(`\n🔄 Rescanning ALL ${sitemaps.length} saved sitemaps...`);
+        } else if (choiceIndex > 0 && choiceIndex <= domainList.length) {
+            const selectedDomain = domainList[choiceIndex - 1];
+            sitemapsToScan = sitemaps.filter(url => url.includes(selectedDomain));
+            console.log(`\n🔄 Rescanning sitemaps for domain: ${selectedDomain} (${sitemapsToScan.length} found)...`);
+        } else {
+            console.log("❌ Invalid choice or cancelled.");
+            return;
+        }
     }
     
     const allNewUrls = new Set();
@@ -230,18 +248,18 @@ export async function rescanSavedSitemaps() {
     }
 }
 
-async function main() {
-    console.log("========================================");
-    console.log("   XML Sitemap Scraper (Robust)");
-    console.log("========================================");
-
-    const sitemapUrl = readlineSync.question('\n👉 Enter the Sitemap URL (e.g., https://example.com/sitemap.xml): ');
-    
+/**
+ * Scrapes a sitemap URL (recursive).
+ * This is an exported function for external use (e.g., Telegram bot).
+ * @param {string} sitemapUrl - The sitemap URL to start scraping from.
+ * @returns {Promise<object>} - Object containing stats and new URLs saved.
+ */
+export async function runSitemapScraper(sitemapUrl) {
     if (!sitemapUrl) {
-        console.log("No URL provided. Exiting.");
-        return;
+        console.log("No URL provided for sitemap scrape.");
+        return { totalSitemapsVisited: 0, totalUrlsFound: 0, newUrlsSaved: 0, filePath: null };
     }
-    
+
     // Save the root sitemap too
     saveDiscoveredSitemap(sitemapUrl, 'manual_entry');
 
@@ -255,21 +273,19 @@ async function main() {
     console.log(`   Total Sitemaps Visited: ${visited.size}`);
     console.log(`   Total URLs Found: ${articleUrls.size}`);
 
-    if (articleUrls.size > 0) {
-        // Deduplication Logic
-        const newUrls = [];
-        let duplicateCount = 0;
+    let newUrlsSaved = 0;
+    let filePath = null;
 
+    if (articleUrls.size > 0) {
+        const newUrls = [];
         for (const url of articleUrls) {
-            if (urlExists(url)) {
-                duplicateCount++;
-            } else {
+            if (!urlExists(url)) {
                 newUrls.push(url);
             }
         }
 
         console.log(`   ----------------------------------------`);
-        console.log(`   Duplicate (Already Scraped): ${duplicateCount}`);
+        console.log(`   Duplicate (Already Scraped): ${articleUrls.size - newUrls.length}`);
         console.log(`   New URLs to Process: ${newUrls.length}`);
         console.log(`   ----------------------------------------`);
 
@@ -279,16 +295,41 @@ async function main() {
 
             const domain = new URL(sitemapUrl).hostname.replace('www.', '');
             const filename = `sitemap_${domain}_${Date.now()}.txt`;
-            const filePath = path.join(toScrapeDir, filename);
+            filePath = path.join(toScrapeDir, filename);
 
             fs.writeFileSync(filePath, newUrls.join('\n'));
-            console.log(`\n💾 Saved ${newUrls.length} NEW URLs to: to scrape/${filename}`);
+            newUrlsSaved = newUrls.length;
+            console.log(`\n💾 Saved ${newUrlsSaved} NEW URLs to: to scrape/${filename}`);
             console.log(`   (You can now use Option 3 in the main scraper to process this file)`);
         } else {
             console.log(`\n🎉 All found URLs have already been scraped! Nothing new to save.`);
         }
     } else {
         console.log("\n⚠️  No URLs found. The sitemap might be empty or blocked.");
+    }
+
+    return { totalSitemapsVisited: visited.size, totalUrlsFound: articleUrls.size, newUrlsSaved, filePath };
+}
+
+async function runSitemapScraperCLI() {
+    console.log("========================================");
+    console.log("   XML Sitemap Scraper (Robust)");
+    console.log("========================================");
+
+    const sitemapUrl = readlineSync.question('\n👉 Enter the Sitemap URL (e.g., https://example.com/sitemap.xml): ');
+    
+    if (!sitemapUrl) {
+        console.log("No URL provided. Exiting.");
+        return;
+    }
+    
+    const { newUrlsSaved, filePath } = await runSitemapScraper(sitemapUrl);
+
+    if (newUrlsSaved > 0) {
+        console.log(`\n💾 Saved ${newUrlsSaved} NEW URLs to: ${filePath}`);
+        console.log(`   (You can now use Option 3 in the main scraper to process this file)`);
+    } else {
+        console.log(`\n🎉 All found URLs have already been scraped! Nothing new to save.`);
     }
 }
 
@@ -372,7 +413,7 @@ export async function runBulkSitemapScraper() {
 // Check if running directly
 import { fileURLToPath } from 'url';
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-    main();
+    runSitemapScraperCLI();
 }
 
-export { main as runSitemapScraper };
+export { runSitemapScraperCLI };
