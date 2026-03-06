@@ -5,6 +5,7 @@ import path from 'path';
 import {
     scrapeSingleUrlAndProcess,
     scrapeUrlsFromInputFile,
+    runScraper,
     processToScrapeFolder,
     retryFailedAndNoResultUrls,
     initializeScraper,
@@ -325,6 +326,8 @@ const buildArticleMenuKeyboard = () => ({
     inline_keyboard: [
         [{ text: '🔗 Scrape URL', callback_data: 'home_usage:scrape_url' }],
         [{ text: '📄 Scrape File', callback_data: 'home_open:scrape_file' }],
+        [{ text: '📤 Upload TXT', callback_data: 'home_wait:upload_txt' }],
+        [{ text: '✍️ Paste URLs', callback_data: 'home_wait:paste_urls' }],
         [{ text: '📁 Scrape Folder', callback_data: 'home_action:scrape_folder' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
@@ -429,6 +432,59 @@ const safeEditMessageText = async (chatId, messageId, text) => {
     }
 };
 
+const pendingChatInputs = new Map();
+
+const setPendingChatInput = (chatId, state) => {
+    pendingChatInputs.set(chatId.toString(), state);
+};
+
+const getPendingChatInput = (chatId) => pendingChatInputs.get(chatId.toString()) || null;
+
+const clearPendingChatInput = (chatId) => {
+    pendingChatInputs.delete(chatId.toString());
+};
+
+const ensureTelegramUploadDir = () => {
+    const uploadDir = path.join(process.cwd(), 'telegram_uploads');
+    if (!fs.existsSync(uploadDir)) {
+        fs.mkdirSync(uploadDir);
+    }
+    return uploadDir;
+};
+
+const sanitizeUploadFileName = (fileName) => {
+    const safeName = path.basename(fileName || 'telegram_urls.txt');
+    return safeName.replace(/[^a-zA-Z0-9._-]/g, '_');
+};
+
+const extractUrlsFromText = (text) => {
+    const matches = text.match(/https?:\/\/[^\s]+/gi) || [];
+    const cleaned = matches
+        .map(url => url.replace(/[),.;!?]+$/g, ''))
+        .filter(url => {
+            try {
+                new URL(url);
+                return true;
+            } catch (error) {
+                return false;
+            }
+        });
+
+    return Array.from(new Set(cleaned));
+};
+
+const downloadTelegramInputFile = async (document) => {
+    const uploadDir = ensureTelegramUploadDir();
+    const downloadedPath = await bot.downloadFile(document.file_id, uploadDir);
+    const finalPath = path.join(uploadDir, `${Date.now()}_${sanitizeUploadFileName(document.file_name)}`);
+
+    if (downloadedPath !== finalPath) {
+        fs.renameSync(downloadedPath, finalPath);
+    }
+
+    return finalPath;
+};
+
 const formatElapsed = (elapsedMs = 0) => {
     const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
     const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
@@ -513,6 +569,41 @@ const runTrackedFileScrape = async (chatId, filePath) => {
     await sendPlainMessage(buildFileScrapeSummaryText(fileName, summary), chatId);
 };
 
+const runTrackedUrlListScrape = async (chatId, label, urls) => {
+    let trackerMessage = await sendPlainMessage(`📄 ${label}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n🔗 -`, chatId);
+    let lastTrackerUpdateAt = 0;
+
+    const updateTracker = async (summary, force = false) => {
+        const now = Date.now();
+        if (!force && now - lastTrackerUpdateAt < 1500) {
+            return;
+        }
+
+        lastTrackerUpdateAt = now;
+        const trackerText = buildFileScrapeProgressText(label, summary);
+
+        try {
+            await safeEditMessageText(chatId, trackerMessage.message_id, trackerText);
+        } catch (error) {
+            trackerMessage = await sendPlainMessage(trackerText, chatId);
+        }
+    };
+
+    const summary = await runScraper(urls, null, false, {
+        onProgress: async (progress) => {
+            await updateTracker(progress, progress.stage === 'start' || progress.stage === 'complete');
+        }
+    });
+
+    if (!summary) {
+        await sendPlainMessage(`No valid URLs found in ${label}.`, chatId);
+        return;
+    }
+
+    await updateTracker(summary, true);
+    await sendPlainMessage(buildFileScrapeSummaryText(label, summary), chatId);
+};
+
 const buildSitemapRescanProgressText = (summary, currentSitemapUrl = '') => {
     const targetLabel = summary.target === 'all' ? 'All' : summary.target;
     const lines = [
@@ -566,6 +657,7 @@ bot.onText(/\/start/, (msg) => {
         bot.sendMessage(msg.chat.id, 'Unauthorized access.');
         return;
     }
+    clearPendingChatInput(msg.chat.id);
     showHomeMenu(msg.chat.id);
     // Set bot commands for better discoverability in Telegram UI
     bot.setMyCommands(BOT_COMMANDS).catch(error => {
@@ -617,6 +709,70 @@ bot.onText(/\/scrape_file/, async (msg) => {
     await showScrapeFileSelectionMenu(msg.chat.id);
 });
 
+bot.on('document', async (msg) => {
+    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
+    if (!isAuthorized) {
+        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
+        return;
+    }
+
+    const fileName = path.basename(msg.document?.file_name || '');
+    const lowerFileName = fileName.toLowerCase();
+    const pendingInput = getPendingChatInput(msg.chat.id);
+
+    if (!lowerFileName.endsWith('.txt') && !lowerFileName.endsWith('.csv')) {
+        if (pendingInput?.type === 'upload_txt') {
+            await sendPlainMessage('Please send a .txt or .csv file.', msg.chat.id);
+        }
+        return;
+    }
+
+    clearPendingChatInput(msg.chat.id);
+
+    try {
+        const filePath = await downloadTelegramInputFile(msg.document);
+        await withBotStatus('scraping', `telegram_file:${path.basename(filePath)}`, async () => {
+            await runTrackedFileScrape(msg.chat.id, filePath);
+        });
+    } catch (error) {
+        console.error(`Failed to handle Telegram document: ${error.message}`);
+        await sendPlainMessage('Failed to download or process the uploaded file.', msg.chat.id);
+    }
+});
+
+bot.on('message', async (msg) => {
+    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
+    if (!isAuthorized || !msg.text || msg.text.startsWith('/')) {
+        return;
+    }
+
+    const pendingInput = getPendingChatInput(msg.chat.id);
+    if (!pendingInput) {
+        return;
+    }
+
+    if (pendingInput.type === 'upload_txt') {
+        await sendPlainMessage('Please send a .txt or .csv file.', msg.chat.id);
+        return;
+    }
+
+    if (pendingInput.type !== 'paste_urls') {
+        return;
+    }
+
+    const urls = extractUrlsFromText(msg.text);
+    if (urls.length === 0) {
+        await sendPlainMessage('No valid URLs found. Send full http or https URLs.', msg.chat.id);
+        return;
+    }
+
+    clearPendingChatInput(msg.chat.id);
+
+    await withBotStatus('scraping', `telegram_input:${urls.length}`, async () => {
+        await runTrackedUrlListScrape(msg.chat.id, 'Telegram Input', urls);
+    });
+});
+
 bot.on('callback_query', async (callbackQuery) => {
     const msg = callbackQuery.message;
     const data = callbackQuery.data || '';
@@ -629,6 +785,8 @@ bot.on('callback_query', async (callbackQuery) => {
         });
         return;
     }
+
+    clearPendingChatInput(msg.chat.id);
 
     if (data === 'home_back') {
         await safeAnswerCallbackQuery(callbackQuery.id);
@@ -663,6 +821,36 @@ bot.on('callback_query', async (callbackQuery) => {
     if (data === 'home_open:scrape_file') {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await showScrapeFileSelectionMenu(msg.chat.id, msg);
+        return;
+    }
+
+    if (data === 'home_wait:upload_txt') {
+        setPendingChatInput(msg.chat.id, { type: 'upload_txt' });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Upload TXT',
+            [
+                'Send a .txt or .csv file in this chat.',
+                'The bot will start scraping as soon as the file arrives.'
+            ],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_wait:paste_urls') {
+        setPendingChatInput(msg.chat.id, { type: 'paste_urls' });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Paste URLs',
+            [
+                'Send one or more full URLs in your next message.',
+                'You can paste one URL per line or a space-separated list.'
+            ],
+            msg
+        );
         return;
     }
 
