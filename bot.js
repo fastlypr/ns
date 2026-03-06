@@ -239,6 +239,35 @@ const BOT_COMMANDS = [
     { command: 'retry_failed', description: 'Retry URLs that previously failed or had no result' },
 ];
 
+const buildHelpMessage = () => [
+    '*Scraper Bot Commands*',
+    '',
+    '🚀 *Scraping*',
+    formatHelpLine('🔗', '/scrape_url <url>', '- Scrape one article URL'),
+    formatHelpLine('📄', '/scrape_file', '- Pick one file from "to scrape"'),
+    formatHelpLine('📁', '/scrape_folder', '- Process all files in "to scrape"'),
+    '',
+    '🗺️ *Sitemaps*',
+    formatHelpLine('🧭', '/sitemap <url>', '- Scan one sitemap recursively'),
+    formatHelpLine('🌐', '/sitemap_bulk', '- Scan all sitemap entries from sitemaps.txt'),
+    formatHelpLine('🔄', '/sitemap_rescan [domain/all]', '- Rescan saved sitemap URLs'),
+    '',
+    '📊 *Results*',
+    formatHelpLine('📡', '/status', '- Show current bot status'),
+    formatHelpLine('📈', '/stats', '- Show scraping statistics'),
+    formatHelpLine('📂', '/download_results', '- Browse and download result CSV files'),
+    formatHelpLine('📤', '/export_urls <status>', '- Export URLs by status'),
+    formatHelpLine('♻️', '/retry_failed', '- Retry failed and no-result URLs'),
+    '',
+    'ℹ️ *Quick Help*',
+    formatHelpLine('❓', '/help', '- Show this menu'),
+    '',
+    '*Examples*',
+    '💡 `/scrape_url https://example.com/article`',
+    '💡 `/sitemap https://example.com/sitemap.xml`',
+    '💡 `/export_urls Success`'
+].join('\n');
+
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env variables.');
     process.exit(1);
@@ -416,7 +445,7 @@ bot.onText(/\/start/, (msg) => {
         bot.sendMessage(msg.chat.id, 'Unauthorized access.');
         return;
     }
-    bot.sendMessage(msg.chat.id, 'Welcome to your Scraper Bot! Use /help to see available commands.');
+    bot.sendMessage(msg.chat.id, `Welcome to your Scraper Bot\\!\n\n${buildHelpMessage()}`, { parse_mode: 'MarkdownV2' });
     // Set bot commands for better discoverability in Telegram UI
     bot.setMyCommands(BOT_COMMANDS).catch(error => {
         console.error(`Failed to set Telegram bot commands: ${error.message}`);
@@ -429,36 +458,7 @@ bot.onText(/\/help/, (msg) => {
         bot.sendMessage(msg.chat.id, 'Unauthorized access.');
         return;
     }
-
-    const helpMessage = [
-        '*Scraper Bot Commands*',
-        '',
-        '🚀 *Scraping*',
-        formatHelpLine('🔗', '/scrape_url <url>', '- Scrape one article URL'),
-        formatHelpLine('📄', '/scrape_file', '- Pick one file from "to scrape"'),
-        formatHelpLine('📁', '/scrape_folder', '- Process all files in "to scrape"'),
-        '',
-        '🗺️ *Sitemaps*',
-        formatHelpLine('🧭', '/sitemap <url>', '- Scan one sitemap recursively'),
-        formatHelpLine('🌐', '/sitemap_bulk', '- Scan all sitemap entries from sitemaps.txt'),
-        formatHelpLine('🔄', '/sitemap_rescan [domain/all]', '- Rescan saved sitemap URLs'),
-        '',
-        '📊 *Results*',
-        formatHelpLine('📡', '/status', '- Show current bot status'),
-        formatHelpLine('📈', '/stats', '- Show scraping statistics'),
-        formatHelpLine('📂', '/download_results', '- Browse and download result CSV files'),
-        formatHelpLine('📤', '/export_urls <status>', '- Export URLs by status'),
-        formatHelpLine('♻️', '/retry_failed', '- Retry failed and no-result URLs'),
-        '',
-        'ℹ️ *Quick Help*',
-        formatHelpLine('❓', '/help', '- Show this menu'),
-        '',
-        '*Examples*',
-        '💡 `/scrape_url https://example.com/article`',
-        '💡 `/sitemap https://example.com/sitemap.xml`',
-        '💡 `/export_urls Success`'
-    ].join('\n');
-    bot.sendMessage(msg.chat.id, helpMessage, { parse_mode: 'MarkdownV2' });
+    bot.sendMessage(msg.chat.id, buildHelpMessage(), { parse_mode: 'MarkdownV2' });
 });
 
 bot.onText(/\/status/, (msg) => {
