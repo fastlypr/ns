@@ -996,9 +996,9 @@ bot.on('callback_query', async (callbackQuery) => {
 
         await safeAnswerCallbackQuery(callbackQuery.id);
         await withBotStatus('scraping', 'folder', async () => {
-            sendMessage(`*Processing files in folder:* ${escapeMarkdownV2(toScrapeDir)}`);
+            await sendPlainMessage(`Processing files in folder: ${toScrapeDir}`, msg.chat.id);
             await processToScrapeFolder(toScrapeDir);
-            sendMessage('*Folder processing complete!*');
+            await sendPlainMessage('Folder processing complete!', msg.chat.id);
         });
         return;
     }
@@ -1155,9 +1155,9 @@ bot.onText(/\/scrape_folder/, async (msg) => {
         fs.mkdirSync(toScrapeDir);
     }
     await withBotStatus('scraping', 'folder', async () => {
-        sendMessage(`*Processing files in folder:* ${escapeMarkdownV2(toScrapeDir)}`);
+        await sendPlainMessage(`Processing files in folder: ${toScrapeDir}`, msg.chat.id);
         await processToScrapeFolder(toScrapeDir);
-        sendMessage('*Folder processing complete!*');
+        await sendPlainMessage('Folder processing complete!', msg.chat.id);
     });
 });
 
