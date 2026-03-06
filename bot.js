@@ -195,13 +195,13 @@ const buildSitemapRescanKeyboard = () => {
 const runSitemapRescanFlow = async (chatId, targetDomain) => {
     await withBotStatus('sitemap_rescan', `rescan:${targetDomain || 'all'}`, async () => {
         if (targetDomain && targetDomain !== 'all') {
-            sendMessage(`*Rescanning saved sitemaps for:* ${escapeMarkdownV2(targetDomain)}...`, chatId);
+            await sendPlainMessage(`Rescanning saved sitemaps for: ${targetDomain}...`, chatId);
         } else {
-            sendMessage('*Rescanning ALL saved sitemaps...*', chatId);
+            await sendPlainMessage('Rescanning ALL saved sitemaps...', chatId);
         }
 
         await rescanSavedSitemaps(targetDomain === 'all' ? 'all' : targetDomain);
-        sendMessage('*Sitemap rescan complete!*', chatId);
+        await sendPlainMessage('Sitemap rescan complete!', chatId);
     });
 };
 
@@ -239,6 +239,10 @@ let currentTask = null;
 // Send message helper
 export const sendMessage = (text, chatId = TELEGRAM_CHAT_ID, parseMode = 'MarkdownV2') => {
     return bot.sendMessage(chatId, text, { parse_mode: parseMode });
+};
+
+const sendPlainMessage = (text, chatId = TELEGRAM_CHAT_ID) => {
+    return bot.sendMessage(chatId, text);
 };
 
 const withBotStatus = async (status, task, action) => {
