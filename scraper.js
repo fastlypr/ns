@@ -561,10 +561,35 @@ function removeLineFromFile(filePath, urlToRemove) {
 /**
  * Main scraping runner with worker pool
  */
-export async function runScraper(urls, sourceFilePath = null, force = false) {
+export async function runScraper(urls, sourceFilePath = null, force = false, options = {}) {
     ensureScraperInitialized();
+    const { onProgress } = options;
+    const startedAt = Date.now();
+    const progress = {
+        totalUrls: urls.length,
+        processedUrls: 0,
+        successCount: 0,
+        failedCount: 0,
+        noResultCount: 0,
+        skippedCount: 0,
+        currentUrl: '',
+        elapsedMs: 0,
+        sourceFilePath
+    };
+
+    const emitProgress = async (stage = 'progress', extra = {}) => {
+        progress.elapsedMs = Date.now() - startedAt;
+        if (typeof onProgress === 'function') {
+            await onProgress({
+                stage,
+                ...progress,
+                ...extra
+            });
+        }
+    };
 
     console.log(`\n🚀 Processing ${urls.length} URL(s) with parallel limit of ${CONCURRENCY_LIMIT}...`);
+    await emitProgress('start');
 
     // Worker function to process a single URL
     const processUrl = async (rawUrl) => {
@@ -577,6 +602,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false) {
         if (!url.startsWith('http')) {
             url = 'https://' + url;
         }
+        progress.currentUrl = url;
 
         // Check if already scraped (unless forced)
         if (!force && urlExists(url)) {
@@ -585,6 +611,9 @@ export async function runScraper(urls, sourceFilePath = null, force = false) {
             if (sourceFilePath) {
                 removeLineFromFile(sourceFilePath, rawUrl);
             }
+            progress.processedUrls++;
+            progress.skippedCount++;
+            await emitProgress('progress', { currentUrl: url, lastStatus: 'Skipped' });
             return;
         }
         
@@ -598,6 +627,9 @@ export async function runScraper(urls, sourceFilePath = null, force = false) {
         if (result.error) {
             logScrapeResult(url, 'Failed', result.error);
             console.log(`❌ Failed: ${url} (${result.error})`);
+            progress.processedUrls++;
+            progress.failedCount++;
+            await emitProgress('progress', { currentUrl: url, lastStatus: 'Failed' });
             return;
         }
         
@@ -613,9 +645,15 @@ export async function runScraper(urls, sourceFilePath = null, force = false) {
             
             // Save to CSV immediately
             saveResults(result);
+            progress.processedUrls++;
+            progress.successCount++;
+            await emitProgress('progress', { currentUrl: url, lastStatus: 'Success' });
         } else {
             logScrapeResult(url, 'No_Result', 'No social links found');
             console.log('⚠️  No social media links found (Marked as No Result).');
+            progress.processedUrls++;
+            progress.noResultCount++;
+            await emitProgress('progress', { currentUrl: url, lastStatus: 'No_Result' });
         }
     };
 
@@ -640,6 +678,8 @@ export async function runScraper(urls, sourceFilePath = null, force = false) {
     await Promise.all(activeWorkers);
     
     console.log('\n========================================');
+    await emitProgress('complete');
+    return { ...progress, elapsedMs: Date.now() - startedAt };
 }
 
 /**
@@ -647,12 +687,12 @@ export async function runScraper(urls, sourceFilePath = null, force = false) {
  * This is an exported function for external use (e.g., Telegram bot).
  * @param {string} url - The URL to scrape.
  */
-export async function scrapeSingleUrlAndProcess(url) {
+export async function scrapeSingleUrlAndProcess(url, options = {}) {
     if (!url) {
         console.log("No URL provided for single scrape.");
         return;
     }
-    await runScraper([url], null, false);
+    return runScraper([url], null, false, options);
 }
 
 /**
@@ -660,7 +700,7 @@ export async function scrapeSingleUrlAndProcess(url) {
  * This is an exported function for external use (e.g., Telegram bot).
  * @param {string} filePath - The path to the input file containing URLs.
  */
-export async function scrapeUrlsFromInputFile(filePath) {
+export async function scrapeUrlsFromInputFile(filePath, options = {}) {
     if (!fs.existsSync(filePath)) {
         console.log(`Error: Input file not found at ${filePath}`);
         return;
@@ -671,7 +711,7 @@ export async function scrapeUrlsFromInputFile(filePath) {
 
     if (fileUrls.length > 0) {
         console.log(`Processing ${fileUrls.length} URLs from ${filePath}...`);
-        await runScraper(fileUrls, filePath, false);
+        return runScraper(fileUrls, filePath, false, options);
     } else {
         console.log(`No valid URLs found in ${filePath}`);
     }

@@ -279,6 +279,90 @@ const safeEditMessageText = async (chatId, messageId, text) => {
     }
 };
 
+const formatElapsed = (elapsedMs = 0) => {
+    const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+    const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+    const seconds = String(totalSeconds % 60).padStart(2, '0');
+    return `${minutes}:${seconds}`;
+};
+
+const buildProgressBar = (processed, total, size = 10) => {
+    if (!total) {
+        return '░'.repeat(size);
+    }
+
+    const ratio = Math.max(0, Math.min(1, processed / total));
+    const filled = Math.round(ratio * size);
+    return `${'▓'.repeat(filled)}${'░'.repeat(size - filled)}`;
+};
+
+const shortenText = (text, maxLength = 60) => {
+    if (!text) {
+        return '-';
+    }
+
+    return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+};
+
+const buildFileScrapeProgressText = (fileName, summary) => {
+    const percent = summary.totalUrls === 0 ? 0 : Math.round((summary.processedUrls / summary.totalUrls) * 100);
+    return [
+        `📄 ${fileName}`,
+        `${buildProgressBar(summary.processedUrls, summary.totalUrls)} ${percent}%  •  ${summary.processedUrls}/${summary.totalUrls}`,
+        `⏱ ${formatElapsed(summary.elapsedMs)}  •  ✅ ${summary.successCount}  •  ❌ ${summary.failedCount}  •  ⚠️ ${summary.noResultCount}`,
+        `🔗 ${shortenText(summary.currentUrl)}`
+    ].join('\n');
+};
+
+const buildFileScrapeSummaryText = (fileName, summary) => {
+    return [
+        '✅ Scrape Complete',
+        `File: ${fileName}`,
+        `Processed: ${summary.processedUrls}/${summary.totalUrls}`,
+        `Success: ${summary.successCount}`,
+        `Failed: ${summary.failedCount}`,
+        `No Result: ${summary.noResultCount}`,
+        `Skipped: ${summary.skippedCount}`,
+        `Elapsed: ${formatElapsed(summary.elapsedMs)}`
+    ].join('\n');
+};
+
+const runTrackedFileScrape = async (chatId, filePath) => {
+    const fileName = path.basename(filePath);
+    let trackerMessage = await sendPlainMessage(`📄 ${fileName}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n🔗 -`, chatId);
+    let lastTrackerUpdateAt = 0;
+
+    const updateTracker = async (summary, force = false) => {
+        const now = Date.now();
+        if (!force && now - lastTrackerUpdateAt < 1500) {
+            return;
+        }
+
+        lastTrackerUpdateAt = now;
+        const trackerText = buildFileScrapeProgressText(fileName, summary);
+
+        try {
+            await safeEditMessageText(chatId, trackerMessage.message_id, trackerText);
+        } catch (error) {
+            trackerMessage = await sendPlainMessage(trackerText, chatId);
+        }
+    };
+
+    const summary = await scrapeUrlsFromInputFile(filePath, {
+        onProgress: async (progress) => {
+            await updateTracker(progress, progress.stage === 'start' || progress.stage === 'complete');
+        }
+    });
+
+    if (!summary) {
+        await sendPlainMessage(`No valid URLs found in ${fileName}.`, chatId);
+        return;
+    }
+
+    await updateTracker(summary, true);
+    await sendPlainMessage(buildFileScrapeSummaryText(fileName, summary), chatId);
+};
+
 const buildSitemapRescanProgressText = (summary, currentSitemapUrl = '') => {
     const targetLabel = summary.target === 'all' ? 'All' : summary.target;
     const lines = [
@@ -457,9 +541,7 @@ bot.on('callback_query', async (callbackQuery) => {
         await safeAnswerCallbackQuery(callbackQuery.id);
 
         await withBotStatus('scraping', `file:${filename}`, async () => {
-            sendMessage(`*Scraping URLs from:* ${escapeMarkdownV2(filename)}`);
-            await scrapeUrlsFromInputFile(filePath);
-            sendMessage('*File scraping complete!*');
+            await runTrackedFileScrape(msg.chat.id, filePath);
         });
         return;
     }
