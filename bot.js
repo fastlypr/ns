@@ -31,6 +31,8 @@ const getResultDirPath = () => path.join(process.cwd(), 'result');
 
 const getAllResultsPath = () => path.join(getResultDirPath(), 'all_results.csv');
 
+const getHistoryDbPath = () => path.join(process.cwd(), 'history.db');
+
 const listCsvFilesInFolder = (folderName) => {
     const safeFolderName = path.basename(folderName || '');
     if (!safeFolderName || safeFolderName.startsWith('.')) {
@@ -64,10 +66,17 @@ const listResultFoldersWithCsv = () => {
 const buildResultsRootKeyboard = () => {
     const inlineKeyboard = [];
     const allResultsPath = getAllResultsPath();
+    const historyDbPath = getHistoryDbPath();
 
     if (fs.existsSync(allResultsPath)) {
         inlineKeyboard.push([
             { text: '📄 all_results.csv', callback_data: 'results_root_all' }
+        ]);
+    }
+
+    if (fs.existsSync(historyDbPath)) {
+        inlineKeyboard.push([
+            { text: '🗄️ history.db backup', callback_data: 'results_root_db' }
         ]);
     }
 
@@ -167,19 +176,13 @@ const showScrapeFileSelectionMenu = async (chatId, message = null) => {
 };
 
 const showResultsRootMenu = async (chatId, message = null) => {
-    const resultDir = getResultDirPath();
-    if (!fs.existsSync(resultDir)) {
-        await sendOrEditMenu(chatId, 'No result folder found yet.', undefined, message);
-        return;
-    }
-
     const keyboard = buildResultsRootKeyboard();
-    if (keyboard.inline_keyboard.length === 0) {
-        await sendOrEditMenu(chatId, 'No result CSV files are available yet.', undefined, message);
+    if (keyboard.inline_keyboard.length <= 1) {
+        await sendOrEditMenu(chatId, 'No result or backup files are available yet.', undefined, message);
         return;
     }
 
-    await sendOrEditMenu(chatId, 'Select a result CSV to download:', keyboard, message);
+    await sendOrEditMenu(chatId, 'Select a result or backup file to download:', keyboard, message);
 };
 
 const showFolderFilesMenu = async (chatId, folderName, message = null) => {
@@ -1035,6 +1038,18 @@ bot.on('callback_query', async (callbackQuery) => {
 
         await safeAnswerCallbackQuery(callbackQuery.id);
         await sendDocumentFile(msg.chat.id, allResultsPath, '📄 all_results.csv');
+        return;
+    }
+
+    if (data === 'results_root_db') {
+        const historyDbPath = getHistoryDbPath();
+        if (!fs.existsSync(historyDbPath)) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
+            return;
+        }
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendDocumentFile(msg.chat.id, historyDbPath, '🗄️ history.db backup');
         return;
     }
 
