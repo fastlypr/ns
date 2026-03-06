@@ -95,6 +95,22 @@ const buildFolderFilesKeyboard = (folderName) => {
 const sendDocumentFile = (chatId, filePath, caption) =>
     bot.sendDocument(chatId, filePath, { caption });
 
+const safeAnswerCallbackQuery = async (callbackQueryId, options = {}) => {
+    try {
+        await bot.answerCallbackQuery(callbackQueryId, options);
+    } catch (error) {
+        const description = error?.response?.body?.description || error?.message || '';
+        if (
+            description.includes('query is too old') ||
+            description.includes('query ID is invalid')
+        ) {
+            console.warn(`Callback query acknowledgement skipped: ${description}`);
+            return;
+        }
+        throw error;
+    }
+};
+
 const sendOrEditMenu = async (chatId, text, replyMarkup, message = null) => {
     if (message && message.message_id) {
         try {
@@ -307,7 +323,7 @@ bot.on('callback_query', async (callbackQuery) => {
     const isAuthorized = msg && msg.chat && msg.chat.id.toString() === TELEGRAM_CHAT_ID;
 
     if (!isAuthorized) {
-        await bot.answerCallbackQuery(callbackQuery.id, {
+        await safeAnswerCallbackQuery(callbackQuery.id, {
             text: 'Unauthorized',
             show_alert: true
         });
@@ -318,34 +334,35 @@ bot.on('callback_query', async (callbackQuery) => {
         const filename = path.basename(data.replace('scrape_file_select:', ''));
         const filePath = path.join(process.cwd(), 'to scrape', filename);
         if (!fs.existsSync(filePath)) {
-            await bot.answerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
             return;
         }
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
 
         await withBotStatus('scraping', `file:${filename}`, async () => {
             sendMessage(`*Scraping URLs from:* ${escapeMarkdownV2(filename)}`);
             await scrapeUrlsFromInputFile(filePath);
             sendMessage('*File scraping complete!*');
         });
-        await bot.answerCallbackQuery(callbackQuery.id);
         return;
     }
 
     if (data === 'results_root_all') {
         const allResultsPath = getAllResultsPath();
         if (!fs.existsSync(allResultsPath)) {
-            await bot.answerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
             return;
         }
 
+        await safeAnswerCallbackQuery(callbackQuery.id);
         await sendDocumentFile(msg.chat.id, allResultsPath, '📄 all_results.csv');
-        await bot.answerCallbackQuery(callbackQuery.id);
         return;
     }
 
     if (data === 'results_back_root') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
         await showResultsRootMenu(msg.chat.id, msg);
-        await bot.answerCallbackQuery(callbackQuery.id);
         return;
     }
 
@@ -354,11 +371,11 @@ bot.on('callback_query', async (callbackQuery) => {
         const rendered = await showFolderFilesMenu(msg.chat.id, folderName, msg);
 
         if (!rendered) {
-            await bot.answerCallbackQuery(callbackQuery.id, { text: 'Folder is empty or missing', show_alert: true });
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Folder is empty or missing', show_alert: true });
             return;
         }
 
-        await bot.answerCallbackQuery(callbackQuery.id);
+        await safeAnswerCallbackQuery(callbackQuery.id);
         return;
     }
 
@@ -370,22 +387,22 @@ bot.on('callback_query', async (callbackQuery) => {
         const availableFiles = listCsvFilesInFolder(folderName);
 
         if (!folderName || !fileName || !availableFiles.includes(fileName)) {
-            await bot.answerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
             return;
         }
 
         const filePath = path.join(getResultDirPath(), folderName, fileName);
         if (!fs.existsSync(filePath)) {
-            await bot.answerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
             return;
         }
 
+        await safeAnswerCallbackQuery(callbackQuery.id);
         await sendDocumentFile(msg.chat.id, filePath, `📄 ${folderName} / ${fileName}`);
-        await bot.answerCallbackQuery(callbackQuery.id);
         return;
     }
 
-    await bot.answerCallbackQuery(callbackQuery.id); // Acknowledge the callback query
+    await safeAnswerCallbackQuery(callbackQuery.id); // Acknowledge the callback query
 });
 
 bot.onText(/\/scrape_folder/, async (msg) => {
