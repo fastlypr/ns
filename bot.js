@@ -136,7 +136,7 @@ const sendOrEditMenu = async (chatId, text, replyMarkup, message = null) => {
 };
 
 const showHomeMenu = async (chatId, message = null) => {
-    await sendOrEditMenu(chatId, 'Choose an action:', buildHomeMenuKeyboard(), message);
+    await sendOrEditMenu(chatId, 'Choose a section:', buildHomeMenuKeyboard(), message);
 };
 
 const showHomeInfoPage = async (chatId, title, lines, message = null) => {
@@ -306,23 +306,51 @@ const buildHelpMessage = () => [
 
 const buildHomeMenuKeyboard = () => ({
     inline_keyboard: [
-        [{ text: '🔗 Scrape URL', callback_data: 'home_usage:scrape_url' }],
-        [{ text: '📄 Scrape File', callback_data: 'home_open:scrape_file' }],
-        [{ text: '📁 Scrape Folder', callback_data: 'home_action:scrape_folder' }],
-        [{ text: '🧭 Scan Sitemap URL', callback_data: 'home_usage:sitemap' }],
-        [{ text: '🌐 Sitemap Bulk', callback_data: 'home_action:sitemap_bulk' }],
-        [{ text: '🔄 Sitemap Rescan', callback_data: 'home_open:sitemap_rescan' }],
-        [{ text: '📂 Download Results', callback_data: 'home_open:download_results' }],
-        [{ text: '📤 Export URLs', callback_data: 'home_usage:export_urls' }],
-        [{ text: '📡 Bot Status', callback_data: 'home_view:status' }],
-        [{ text: '📈 Statistics', callback_data: 'home_view:stats' }],
-        [{ text: '♻️ Retry Failed', callback_data: 'home_action:retry_failed' }],
-        [{ text: '❓ Help', callback_data: 'home_view:help' }]
+        [{ text: '📰 Article', callback_data: 'home_section:article' }],
+        [{ text: '🗺️ XML', callback_data: 'home_section:xml' }],
+        [{ text: '📂 Results', callback_data: 'home_section:results' }],
+        [{ text: '⚙️ System', callback_data: 'home_section:system' }]
     ]
 });
 
 const buildHomeBackKeyboard = () => ({
     inline_keyboard: [
+        [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
+    ]
+});
+
+const buildArticleMenuKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '🔗 Scrape URL', callback_data: 'home_usage:scrape_url' }],
+        [{ text: '📄 Scrape File', callback_data: 'home_open:scrape_file' }],
+        [{ text: '📁 Scrape Folder', callback_data: 'home_action:scrape_folder' }],
+        [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
+    ]
+});
+
+const buildXmlMenuKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '🧭 Scan Sitemap URL', callback_data: 'home_usage:sitemap' }],
+        [{ text: '🌐 Sitemap Bulk', callback_data: 'home_action:sitemap_bulk' }],
+        [{ text: '🔄 Sitemap Rescan', callback_data: 'home_open:sitemap_rescan' }],
+        [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
+    ]
+});
+
+const buildResultsMenuKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '📂 Download Results', callback_data: 'home_open:download_results' }],
+        [{ text: '📤 Export URLs', callback_data: 'home_usage:export_urls' }],
+        [{ text: '♻️ Retry Failed', callback_data: 'home_action:retry_failed' }],
+        [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
+    ]
+});
+
+const buildSystemMenuKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '📡 Bot Status', callback_data: 'home_view:status' }],
+        [{ text: '📈 Statistics', callback_data: 'home_view:stats' }],
+        [{ text: '❓ Help', callback_data: 'home_view:help' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
 });
@@ -571,6 +599,30 @@ bot.on('callback_query', async (callbackQuery) => {
     if (data === 'home_back') {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await showHomeMenu(msg.chat.id, msg);
+        return;
+    }
+
+    if (data === 'home_section:article') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(msg.chat.id, 'Article options:', buildArticleMenuKeyboard(), msg);
+        return;
+    }
+
+    if (data === 'home_section:xml') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(msg.chat.id, 'XML options:', buildXmlMenuKeyboard(), msg);
+        return;
+    }
+
+    if (data === 'home_section:results') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(msg.chat.id, 'Results options:', buildResultsMenuKeyboard(), msg);
+        return;
+    }
+
+    if (data === 'home_section:system') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(msg.chat.id, 'System options:', buildSystemMenuKeyboard(), msg);
         return;
     }
 
