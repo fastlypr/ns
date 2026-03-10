@@ -322,12 +322,12 @@ const buildSitemapRescanKeyboard = () => {
 
 const runSitemapRescanFlow = async (chatId, targetDomain) => {
     await withBotStatus('sitemap_rescan', `rescan:${targetDomain || 'all'}`, async () => {
-        let trackerMessage = await sendPlainMessage('Starting sitemap rescan...', chatId);
+        let trackerMessage = await sendPlainMessage('🗺️ XML Rescan Running\nStarting...', chatId);
         let lastTrackerUpdateAt = 0;
 
         const updateTracker = async (summary, currentSitemapUrl = '', force = false) => {
             const now = Date.now();
-            if (!force && now - lastTrackerUpdateAt < 1500) {
+            if (!force && now - lastTrackerUpdateAt < LIVE_TRACKER_INTERVAL_MS) {
                 return;
             }
 
@@ -425,6 +425,8 @@ const buildArticleMenuKeyboard = () => ({
 const buildXmlMenuKeyboard = () => ({
     inline_keyboard: [
         [{ text: '🧭 Scan Sitemap URL', callback_data: 'home_usage:sitemap' }],
+        [{ text: '📤 Upload TXT', callback_data: 'home_wait:upload_sitemap_txt' }],
+        [{ text: '✍️ Paste URLs', callback_data: 'home_wait:paste_sitemap_urls' }],
         [{ text: '🌐 Sitemap Bulk', callback_data: 'home_action:sitemap_bulk' }],
         [{ text: '🔄 Sitemap Rescan', callback_data: 'home_open:sitemap_rescan' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
@@ -521,6 +523,8 @@ const safeEditMessageText = async (chatId, messageId, text) => {
     }
 };
 
+const LIVE_TRACKER_INTERVAL_MS = 60 * 1000;
+
 const pendingChatInputs = new Map();
 
 const setPendingChatInput = (chatId, state) => {
@@ -574,12 +578,23 @@ const downloadTelegramInputFile = async (document) => {
     return finalPath;
 };
 
+const extractUrlsFromFile = (filePath) => {
+    if (!fs.existsSync(filePath)) {
+        return [];
+    }
+
+    return extractUrlsFromText(fs.readFileSync(filePath, 'utf8'));
+};
+
 const formatElapsed = (elapsedMs = 0) => {
     const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
     const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
     const seconds = String(totalSeconds % 60).padStart(2, '0');
     return `${minutes}:${seconds}`;
 };
+
+const formatUpdatedTime = () =>
+    new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
 
 const buildProgressBar = (processed, total, size = 10) => {
     if (!total) {
@@ -622,6 +637,45 @@ const buildFileScrapeSummaryText = (fileName, summary) => {
     ].join('\n');
 };
 
+const buildFolderScrapeProgressText = (summary) => {
+    const percent = summary.totalUrls === 0 ? 0 : Math.round((summary.processedUrls / summary.totalUrls) * 100);
+    const activeFileCount = summary.totalFiles === 0
+        ? 0
+        : Math.min(summary.processedFiles + (summary.processedFiles < summary.totalFiles ? 1 : 0), summary.totalFiles);
+
+    return [
+        '📁 Folder Scrape Running',
+        `Folder: ${summary.folderName || 'to scrape'}`,
+        '',
+        `Files: ${activeFileCount}/${summary.totalFiles}`,
+        `Current File: ${summary.currentFile || '-'}`,
+        '',
+        `URLs: ${summary.processedUrls}/${summary.totalUrls}`,
+        `${buildProgressBar(summary.processedUrls, summary.totalUrls)} ${percent}%`,
+        '',
+        `✅ Success: ${summary.successCount}`,
+        `❌ Failed: ${summary.failedCount}`,
+        `⚠️ No Result: ${summary.noResultCount}`,
+        `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
+        '',
+        `🔗 Current: ${summary.currentUrl || '-'}`,
+        `🕒 Updated: ${formatUpdatedTime()}`
+    ].join('\n');
+};
+
+const buildFolderScrapeSummaryText = (summary) => {
+    return [
+        '✅ Folder Scrape Complete',
+        `Folder: ${summary.folderName || 'to scrape'}`,
+        `Files Processed: ${summary.processedFiles}/${summary.totalFiles}`,
+        `Total URLs: ${summary.processedUrls}/${summary.totalUrls}`,
+        `Success: ${summary.successCount}`,
+        `Failed: ${summary.failedCount}`,
+        `No Result: ${summary.noResultCount}`,
+        `Elapsed: ${formatElapsed(summary.elapsedMs)}`
+    ].join('\n');
+};
+
 const runTrackedFileScrape = async (chatId, filePath) => {
     const fileName = path.basename(filePath);
     let trackerMessage = await sendPlainMessage(`📄 ${fileName}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n🔗 -`, chatId);
@@ -656,6 +710,55 @@ const runTrackedFileScrape = async (chatId, filePath) => {
 
     await updateTracker(summary, true);
     await sendPlainMessage(buildFileScrapeSummaryText(fileName, summary), chatId);
+};
+
+const runTrackedFolderScrape = async (chatId, toScrapeDir) => {
+    const initialSummary = {
+        folderName: path.basename(toScrapeDir),
+        totalFiles: 0,
+        processedFiles: 0,
+        currentFile: '-',
+        totalUrls: 0,
+        processedUrls: 0,
+        successCount: 0,
+        failedCount: 0,
+        noResultCount: 0,
+        currentUrl: '',
+        elapsedMs: 0
+    };
+
+    let trackerMessage = await sendPlainMessage(buildFolderScrapeProgressText(initialSummary), chatId);
+    let lastTrackerUpdateAt = 0;
+
+    const updateTracker = async (summary, force = false) => {
+        const now = Date.now();
+        if (!force && now - lastTrackerUpdateAt < LIVE_TRACKER_INTERVAL_MS) {
+            return;
+        }
+
+        lastTrackerUpdateAt = now;
+        const trackerText = buildFolderScrapeProgressText(summary);
+
+        try {
+            await safeEditMessageText(chatId, trackerMessage.message_id, trackerText);
+        } catch (error) {
+            trackerMessage = await sendPlainMessage(trackerText, chatId);
+        }
+    };
+
+    const summary = await processToScrapeFolder(toScrapeDir, {
+        onProgress: async ({ stage, summary: progressSummary }) => {
+            await updateTracker(progressSummary, stage === 'start' || stage === 'complete');
+        }
+    });
+
+    if (!summary) {
+        await sendPlainMessage('No valid URLs found in the folder.', chatId);
+        return;
+    }
+
+    await updateTracker(summary, true);
+    await sendPlainMessage(buildFolderScrapeSummaryText(summary), chatId);
 };
 
 const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
@@ -693,19 +796,126 @@ const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
     await sendPlainMessage(buildFileScrapeSummaryText(label, summary), chatId);
 };
 
-const buildSitemapRescanProgressText = (summary, currentSitemapUrl = '') => {
-    const targetLabel = summary.target === 'all' ? 'All' : summary.target;
+const buildSitemapScanProgressText = (summary) => {
+    const percent = summary.totalRootSitemaps === 0
+        ? 0
+        : Math.round((summary.processedRootSitemaps / summary.totalRootSitemaps) * 100);
+
+    return [
+        '🗺️ XML Scan Running',
+        `Source: ${summary.sourceLabel}`,
+        '',
+        `Sitemaps: ${summary.processedRootSitemaps}/${summary.totalRootSitemaps}`,
+        `${buildProgressBar(summary.processedRootSitemaps, summary.totalRootSitemaps)} ${percent}%`,
+        '',
+        `🌐 Visited: ${summary.uniqueSitemapsVisited}`,
+        `🆕 URLs Found: ${summary.newUrlsFound}`,
+        `💾 Saved: ${summary.newUrlsSaved}`,
+        `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
+        '',
+        `🔗 Current: ${summary.currentSitemapUrl || '-'}`,
+        `🕒 Updated: ${formatUpdatedTime()}`
+    ].join('\n');
+};
+
+const buildSitemapScanSummaryText = (summary) => {
     const lines = [
-        'Sitemap rescan running',
-        `Target: ${targetLabel}`,
-        `Completed: ${summary.processedRootSitemaps}/${summary.totalRootSitemaps} root sitemaps`,
+        '✅ XML Scan Complete',
+        `Source: ${summary.sourceLabel}`,
+        `Sitemaps: ${summary.processedRootSitemaps}/${summary.totalRootSitemaps}`,
         `Visited: ${summary.uniqueSitemapsVisited} sitemap files`,
-        `New URLs found: ${summary.newUrlsFound}`
+        `URLs Found: ${summary.newUrlsFound}`,
+        `Saved: ${summary.newUrlsSaved}`,
+        `Elapsed: ${formatElapsed(summary.elapsedMs)}`
     ];
 
-    if (currentSitemapUrl) {
-        lines.push(`Current: ${currentSitemapUrl}`);
+    if (summary.savedFiles.length === 1) {
+        lines.push(`Saved file: ${summary.savedFiles[0]}`);
+    } else if (summary.savedFiles.length > 1) {
+        lines.push(`Saved files: ${summary.savedFiles.length}`);
+    } else {
+        lines.push('Saved files: none');
     }
+
+    return lines.join('\n');
+};
+
+const runTrackedSitemapScan = async (chatId, sourceLabel, sitemapUrls) => {
+    const startedAt = Date.now();
+    const summary = {
+        sourceLabel,
+        totalRootSitemaps: sitemapUrls.length,
+        processedRootSitemaps: 0,
+        uniqueSitemapsVisited: 0,
+        newUrlsFound: 0,
+        newUrlsSaved: 0,
+        savedFiles: [],
+        currentSitemapUrl: sitemapUrls[0] || '',
+        elapsedMs: 0
+    };
+
+    let trackerMessage = await sendPlainMessage(buildSitemapScanProgressText(summary), chatId);
+    let lastTrackerUpdateAt = 0;
+
+    const updateTracker = async (force = false) => {
+        const now = Date.now();
+        if (!force && now - lastTrackerUpdateAt < LIVE_TRACKER_INTERVAL_MS) {
+            return;
+        }
+
+        lastTrackerUpdateAt = now;
+        summary.elapsedMs = Date.now() - startedAt;
+        const trackerText = buildSitemapScanProgressText(summary);
+
+        try {
+            await safeEditMessageText(chatId, trackerMessage.message_id, trackerText);
+        } catch (error) {
+            trackerMessage = await sendPlainMessage(trackerText, chatId);
+        }
+    };
+
+    for (const sitemapUrl of sitemapUrls) {
+        summary.currentSitemapUrl = sitemapUrl;
+        await updateTracker(false);
+
+        const result = await runSitemapScraper(sitemapUrl);
+        summary.processedRootSitemaps += 1;
+        summary.uniqueSitemapsVisited += result?.totalSitemapsVisited || 0;
+        summary.newUrlsFound += result?.totalUrlsFound || 0;
+        summary.newUrlsSaved += result?.newUrlsSaved || 0;
+
+        if (result?.filePath) {
+            summary.savedFiles.push(path.basename(result.filePath));
+        }
+
+        await updateTracker(false);
+    }
+
+    summary.currentSitemapUrl = '';
+    summary.elapsedMs = Date.now() - startedAt;
+    await updateTracker(true);
+    await sendPlainMessage(buildSitemapScanSummaryText(summary), chatId);
+};
+
+const buildSitemapRescanProgressText = (summary, currentSitemapUrl = '') => {
+    const targetLabel = summary.target === 'all' ? 'All' : summary.target;
+    const percent = summary.totalRootSitemaps === 0
+        ? 0
+        : Math.round((summary.processedRootSitemaps / summary.totalRootSitemaps) * 100);
+    const lines = [
+        '🗺️ XML Rescan Running',
+        `Target: ${targetLabel}`,
+        '',
+        `Sitemaps: ${summary.processedRootSitemaps}/${summary.totalRootSitemaps}`,
+        `${buildProgressBar(summary.processedRootSitemaps, summary.totalRootSitemaps)} ${percent}%`,
+        '',
+        `🌐 Visited: ${summary.uniqueSitemapsVisited}`,
+        `🆕 New URLs: ${summary.newUrlsFound}`,
+        `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
+        '',
+        `🔗 Current: ${currentSitemapUrl || '-'}`,
+        `🕒 Updated: ${formatUpdatedTime()}`
+    ];
 
     return lines.join('\n');
 };
@@ -713,12 +923,13 @@ const buildSitemapRescanProgressText = (summary, currentSitemapUrl = '') => {
 const buildSitemapRescanSummaryText = (summary) => {
     const targetLabel = summary.target === 'all' ? 'All' : summary.target;
     const lines = [
-        'Sitemap rescan complete',
+        '✅ XML Rescan Complete',
         `Target: ${targetLabel}`,
-        `Completed: ${summary.processedRootSitemaps}/${summary.totalRootSitemaps} root sitemaps`,
+        `Sitemaps: ${summary.processedRootSitemaps}/${summary.totalRootSitemaps}`,
         `Skipped: ${summary.skippedRootSitemaps}`,
         `Visited: ${summary.uniqueSitemapsVisited} sitemap files`,
-        `New URLs found: ${summary.newUrlsFound}`
+        `New URLs found: ${summary.newUrlsFound}`,
+        `Elapsed: ${formatElapsed(summary.elapsedMs)}`
     ];
 
     if (summary.filePath) {
@@ -810,7 +1021,7 @@ bot.on('document', async (msg) => {
     const pendingInput = getPendingChatInput(msg.chat.id);
 
     if (!lowerFileName.endsWith('.txt') && !lowerFileName.endsWith('.csv')) {
-        if (pendingInput?.type === 'upload_txt') {
+        if (pendingInput?.type === 'upload_txt' || pendingInput?.type === 'upload_sitemap_txt') {
             await sendPlainMessage('Please send a .txt or .csv file.', msg.chat.id);
         }
         return;
@@ -820,6 +1031,19 @@ bot.on('document', async (msg) => {
 
     try {
         const filePath = await downloadTelegramInputFile(msg.document);
+        if (pendingInput?.type === 'upload_sitemap_txt') {
+            const sitemapUrls = extractUrlsFromFile(filePath);
+            if (sitemapUrls.length === 0) {
+                await sendPlainMessage('No valid sitemap URLs found in the uploaded file.', msg.chat.id);
+                return;
+            }
+
+            await withBotStatus('sitemap', `telegram_sitemap_file:${path.basename(filePath)}`, async () => {
+                await runTrackedSitemapScan(msg.chat.id, `Upload: ${path.basename(filePath)}`, sitemapUrls);
+            });
+            return;
+        }
+
         await withBotStatus('scraping', `telegram_file:${path.basename(filePath)}`, async () => {
             await runTrackedFileScrape(msg.chat.id, filePath);
         });
@@ -842,6 +1066,26 @@ bot.on('message', async (msg) => {
 
     if (pendingInput.type === 'upload_txt') {
         await sendPlainMessage('Please send a .txt or .csv file.', msg.chat.id);
+        return;
+    }
+
+    if (pendingInput.type === 'upload_sitemap_txt') {
+        await sendPlainMessage('Please send a .txt or .csv file with sitemap URLs.', msg.chat.id);
+        return;
+    }
+
+    if (pendingInput.type === 'paste_sitemap_urls') {
+        const sitemapUrls = extractUrlsFromText(msg.text);
+        if (sitemapUrls.length === 0) {
+            await sendPlainMessage('No valid sitemap URLs found. Send full http or https URLs.', msg.chat.id);
+            return;
+        }
+
+        clearPendingChatInput(msg.chat.id);
+
+        await withBotStatus('sitemap', `telegram_sitemap_input:${sitemapUrls.length}`, async () => {
+            await runTrackedSitemapScan(msg.chat.id, 'Telegram Input', sitemapUrls);
+        });
         return;
     }
 
@@ -936,6 +1180,36 @@ bot.on('callback_query', async (callbackQuery) => {
             'Paste URLs',
             [
                 'Send one or more full URLs in your next message.',
+                'You can paste one URL per line or a space-separated list.'
+            ],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_wait:upload_sitemap_txt') {
+        setPendingChatInput(msg.chat.id, { type: 'upload_sitemap_txt' });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Upload XML TXT',
+            [
+                'Send a .txt or .csv file with sitemap URLs in this chat.',
+                'The bot will start scanning as soon as the file arrives.'
+            ],
+            msg
+        );
+        return;
+    }
+
+    if (data === 'home_wait:paste_sitemap_urls') {
+        setPendingChatInput(msg.chat.id, { type: 'paste_sitemap_urls' });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            'Paste Sitemap URLs',
+            [
+                'Send one or more sitemap URLs in your next message.',
                 'You can paste one URL per line or a space-separated list.'
             ],
             msg
@@ -1136,9 +1410,7 @@ bot.on('callback_query', async (callbackQuery) => {
 
         await safeAnswerCallbackQuery(callbackQuery.id);
         await withBotStatus('scraping', 'folder', async () => {
-            await sendPlainMessage(`Processing files in folder: ${toScrapeDir}`, msg.chat.id);
-            await processToScrapeFolder(toScrapeDir);
-            await sendPlainMessage('Folder processing complete!', msg.chat.id);
+            await runTrackedFolderScrape(msg.chat.id, toScrapeDir);
         });
         return;
     }
@@ -1285,9 +1557,7 @@ bot.onText(/\/scrape_folder/, async (msg) => {
         fs.mkdirSync(toScrapeDir);
     }
     await withBotStatus('scraping', 'folder', async () => {
-        await sendPlainMessage(`Processing files in folder: ${toScrapeDir}`, msg.chat.id);
-        await processToScrapeFolder(toScrapeDir);
-        await sendPlainMessage('Folder processing complete!', msg.chat.id);
+        await runTrackedFolderScrape(msg.chat.id, toScrapeDir);
     });
 });
 

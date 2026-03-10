@@ -151,6 +151,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
             await onProgress(payload);
         }
     };
+    const startedAt = Date.now();
 
     const sitemaps = getAllSitemaps();
     const summary = {
@@ -161,11 +162,13 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         uniqueSitemapsVisited: 0,
         newUrlsFound: 0,
         newUrlsSaved: 0,
-        filePath: null
+        filePath: null,
+        elapsedMs: 0
     };
 
     if (sitemaps.length === 0) {
         console.log("⚠️  No saved sitemaps found in database.");
+        summary.elapsedMs = Date.now() - startedAt;
         await emitProgress({ stage: 'complete', summary: { ...summary } });
         return summary;
     }
@@ -216,6 +219,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
             console.log(`\n🔄 Rescanning sitemaps for domain: ${selectedDomain} (${sitemapsToScan.length} found)...`);
         } else {
             console.log("❌ Invalid choice or cancelled.");
+            summary.elapsedMs = Date.now() - startedAt;
             await emitProgress({ stage: 'complete', summary: { ...summary } });
             return summary;
         }
@@ -225,10 +229,12 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
 
     if (sitemapsToScan.length === 0) {
         console.log("⚠️  No matching saved sitemaps found.");
+        summary.elapsedMs = Date.now() - startedAt;
         await emitProgress({ stage: 'complete', summary: { ...summary } });
         return summary;
     }
 
+    summary.elapsedMs = Date.now() - startedAt;
     await emitProgress({ stage: 'start', summary: { ...summary } });
     
     const allNewUrls = new Set();
@@ -242,6 +248,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         // Skip if already processed in this session (e.g., was a child of a previous sitemap)
         if (visited.has(sitemapUrl)) {
             summary.skippedRootSitemaps++;
+            summary.elapsedMs = Date.now() - startedAt;
             await emitProgress({
                 stage: 'progress',
                 currentIndex: index + 1,
@@ -254,6 +261,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         console.log(`\n🔎 Checking: ${sitemapUrl}`);
         const articleUrls = new Set();
 
+        summary.elapsedMs = Date.now() - startedAt;
         await emitProgress({
             stage: 'scanning',
             currentIndex: index + 1,
@@ -275,6 +283,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         }
 
         summary.newUrlsFound = allNewUrls.size;
+        summary.elapsedMs = Date.now() - startedAt;
         await emitProgress({
             stage: 'progress',
             currentIndex: index + 1,
@@ -300,6 +309,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         console.log(`\n✅ No new URLs found in any sitemap.`);
     }
 
+    summary.elapsedMs = Date.now() - startedAt;
     await emitProgress({ stage: 'complete', summary: { ...summary } });
     return summary;
 }

@@ -757,7 +757,14 @@ export async function scrapeUrlsFromInputFile(filePath, options = {}) {
  * This is an exported function for external use (e.g., Telegram bot).
  * @param {string} toScrapeDir - The path to the 'to scrape' directory.
  */
-export async function processToScrapeFolder(toScrapeDir) {
+export async function processToScrapeFolder(toScrapeDir, options = {}) {
+    const { onProgress } = options;
+    const emitProgress = async (payload) => {
+        if (typeof onProgress === 'function') {
+            await onProgress(payload);
+        }
+    };
+
     try {
         const files = fs.readdirSync(toScrapeDir).filter(f => f.endsWith('.txt') || f.endsWith('.csv'));
         if (files.length === 0) {
@@ -765,27 +772,96 @@ export async function processToScrapeFolder(toScrapeDir) {
             return;
         }
 
-        console.log(`Found ${files.length} files in "to scrape" folder.`);
+        const startedAt = Date.now();
+        const fileEntries = [];
+
         for (const file of files) {
             const filePath = path.join(toScrapeDir, file);
             const content = fs.readFileSync(filePath, 'utf8');
-            const extractedUrls = [];
+            const urls = [];
             content.split('\n').forEach(line => {
                 const trimmed = line.trim();
-                if (trimmed && trimmed.startsWith('http')) extractedUrls.push(trimmed);
+                if (trimmed && trimmed.startsWith('http')) urls.push(trimmed);
             });
 
-            if (extractedUrls.length > 0) {
-                // In Daemon mode, we usually don't force, unless logic requires it. 
-                // But new files implies new requests.
-                // However, if they are duplicates, we might want to skip?
-                // Let's assume standard behavior (no force) but log it.
-                await runScraper(extractedUrls, filePath, false);
+            if (urls.length > 0) {
+                fileEntries.push({ file, filePath, urls });
             } else {
                 console.log(`Deleting empty file: ${file}`);
                 fs.unlinkSync(filePath);
             }
         }
+
+        if (fileEntries.length === 0) {
+            console.log('No valid URLs found in "to scrape" folder.');
+            return;
+        }
+
+        const summary = {
+            folderName: path.basename(toScrapeDir),
+            totalFiles: fileEntries.length,
+            processedFiles: 0,
+            currentFile: fileEntries[0].file,
+            totalUrls: fileEntries.reduce((total, entry) => total + entry.urls.length, 0),
+            processedUrls: 0,
+            successCount: 0,
+            failedCount: 0,
+            noResultCount: 0,
+            skippedCount: 0,
+            currentUrl: '',
+            elapsedMs: 0
+        };
+
+        console.log(`Found ${fileEntries.length} files in "to scrape" folder.`);
+        await emitProgress({ stage: 'start', summary: { ...summary } });
+
+        let completedUrls = 0;
+        let completedSuccess = 0;
+        let completedFailed = 0;
+        let completedNoResult = 0;
+        let completedSkipped = 0;
+
+        for (const entry of fileEntries) {
+            summary.currentFile = entry.file;
+            summary.elapsedMs = Date.now() - startedAt;
+            await emitProgress({ stage: 'file_start', summary: { ...summary } });
+
+            const fileSummary = await runScraper(entry.urls, entry.filePath, false, {
+                onProgress: async (progress) => {
+                    summary.currentFile = entry.file;
+                    summary.processedUrls = completedUrls + (progress.processedUrls || 0);
+                    summary.successCount = completedSuccess + (progress.successCount || 0);
+                    summary.failedCount = completedFailed + (progress.failedCount || 0);
+                    summary.noResultCount = completedNoResult + (progress.noResultCount || 0);
+                    summary.skippedCount = completedSkipped + (progress.skippedCount || 0);
+                    summary.currentUrl = progress.currentUrl || '';
+                    summary.elapsedMs = Date.now() - startedAt;
+                    await emitProgress({ stage: progress.stage || 'progress', summary: { ...summary } });
+                }
+            });
+
+            if (fileSummary) {
+                completedUrls += fileSummary.processedUrls || 0;
+                completedSuccess += fileSummary.successCount || 0;
+                completedFailed += fileSummary.failedCount || 0;
+                completedNoResult += fileSummary.noResultCount || 0;
+                completedSkipped += fileSummary.skippedCount || 0;
+            }
+
+            summary.processedFiles += 1;
+            summary.processedUrls = completedUrls;
+            summary.successCount = completedSuccess;
+            summary.failedCount = completedFailed;
+            summary.noResultCount = completedNoResult;
+            summary.skippedCount = completedSkipped;
+            summary.currentUrl = '';
+            summary.elapsedMs = Date.now() - startedAt;
+
+            await emitProgress({ stage: 'file_complete', summary: { ...summary } });
+        }
+
+        await emitProgress({ stage: 'complete', summary: { ...summary } });
+        return { ...summary };
     } catch (e) {
         console.error(`Error processing 'to scrape' folder: ${e.message}`);
     }
