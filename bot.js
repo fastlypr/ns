@@ -498,14 +498,70 @@ bot.setMyCommands(BOT_COMMANDS).catch(error => {
 // Store bot status (e.g., 'idle', 'scraping', 'sitemap_bulk')
 let botStatus = 'idle';
 let currentTask = null;
+let auxiliaryTaskCounter = 0;
+const auxiliaryTasks = new Map();
+const AUXILIARY_TASK_RETENTION_MS = 5 * 60 * 1000;
+
+const listRunningAuxTasks = () =>
+    Array.from(auxiliaryTasks.values()).filter(task => task.status === 'running');
+
+const registerAuxTask = (type, label) => {
+    const taskId = `${type}:${++auxiliaryTaskCounter}`;
+    auxiliaryTasks.set(taskId, {
+        id: taskId,
+        type,
+        label,
+        status: 'running',
+        startedAt: Date.now()
+    });
+    return taskId;
+};
+
+const finalizeAuxTask = (taskId, status = 'done', error = null) => {
+    const task = auxiliaryTasks.get(taskId);
+    if (!task) {
+        return;
+    }
+
+    task.status = status;
+    task.error = error;
+    task.finishedAt = Date.now();
+
+    const cleanupTimer = setTimeout(() => {
+        auxiliaryTasks.delete(taskId);
+    }, AUXILIARY_TASK_RETENTION_MS);
+
+    if (typeof cleanupTimer.unref === 'function') {
+        cleanupTimer.unref();
+    }
+};
+
+const runAuxTask = async (type, label, action) => {
+    const taskId = registerAuxTask(type, label);
+
+    try {
+        return await action(taskId);
+    } catch (error) {
+        finalizeAuxTask(taskId, 'failed', error?.message || 'Unknown error');
+        throw error;
+    } finally {
+        const task = auxiliaryTasks.get(taskId);
+        if (task && task.status === 'running') {
+            finalizeAuxTask(taskId, 'done');
+        }
+    }
+};
 
 // Send message helper
 export const sendMessage = (text, chatId = TELEGRAM_CHAT_ID, parseMode = 'MarkdownV2') => {
-    return bot.sendMessage(chatId, text, { parse_mode: parseMode });
+    return bot.sendMessage(chatId, text, {
+        parse_mode: parseMode,
+        disable_web_page_preview: true
+    });
 };
 
 const sendPlainMessage = (text, chatId = TELEGRAM_CHAT_ID) => {
-    return bot.sendMessage(chatId, text);
+    return bot.sendMessage(chatId, text, { disable_web_page_preview: true });
 };
 
 const safeEditMessageText = async (chatId, messageId, text) => {
@@ -584,6 +640,11 @@ const extractUrlsFromFile = (filePath) => {
     }
 
     return extractUrlsFromText(fs.readFileSync(filePath, 'utf8'));
+};
+
+const looksLikeSitemapUrl = (url) => {
+    const lowerUrl = String(url || '').toLowerCase();
+    return lowerUrl.includes('sitemap') || lowerUrl.endsWith('.xml');
 };
 
 const formatElapsed = (elapsedMs = 0) => {
@@ -982,7 +1043,13 @@ bot.onText(/\/status/, (msg) => {
     }
 
     const status = getBotStatus();
-    sendMessage(`*Bot Status:* ${escapeMarkdownV2(status.status)}\n*Current Task:* ${escapeMarkdownV2(status.task || 'None')}`);
+    const auxTaskSummary = status.auxTasks.length === 0
+        ? 'None'
+        : status.auxTasks.map((task, index) => `${index + 1}. ${task.label}`).join(' | ');
+
+    sendMessage(
+        `*Bot Status:* ${escapeMarkdownV2(status.status)}\n*Current Task:* ${escapeMarkdownV2(status.task || 'None')}\n*Other Tasks:* ${escapeMarkdownV2(auxTaskSummary)}`
+    );
 });
 
 bot.onText(/\/scrape_url (.+)/, async (msg, match) => {
@@ -1061,6 +1128,12 @@ bot.on('message', async (msg) => {
 
     const pendingInput = getPendingChatInput(msg.chat.id);
     if (!pendingInput) {
+        const sitemapUrls = extractUrlsFromText(msg.text);
+        if (sitemapUrls.length > 0 && sitemapUrls.every(looksLikeSitemapUrl)) {
+            await withBotStatus('sitemap', `telegram_sitemap_input:${sitemapUrls.length}`, async () => {
+                await runTrackedSitemapScan(msg.chat.id, 'Telegram Input', sitemapUrls);
+            });
+        }
         return;
     }
 
@@ -1270,6 +1343,9 @@ bot.on('callback_query', async (callbackQuery) => {
 
     if (data === 'home_view:status') {
         const status = getBotStatus();
+        const auxTaskSummary = status.auxTasks.length === 0
+            ? 'None'
+            : status.auxTasks.map((task, index) => `${index + 1}. ${task.label}`).join(' | ');
         await safeAnswerCallbackQuery(callbackQuery.id);
         await showHomeInfoPage(
             msg.chat.id,
@@ -1277,6 +1353,7 @@ bot.on('callback_query', async (callbackQuery) => {
             [
                 `Status: ${status.status}`,
                 `Current Task: ${status.task || 'None'}`,
+                `Other Tasks: ${auxTaskSummary}`,
                 `Proxy Mode: ${formatProxyModeLabel(getProxyMode())}`
             ],
             msg
@@ -1449,10 +1526,12 @@ bot.on('callback_query', async (callbackQuery) => {
         }
 
         await safeAnswerCallbackQuery(callbackQuery.id);
-        await showResultsRootMenu(msg.chat.id, msg, '⬇️ Preparing all_results.csv...');
         try {
-            await sendDocumentFile(msg.chat.id, allResultsPath, '📄 all_results.csv');
-            await showResultsRootMenu(msg.chat.id, msg, '✅ all_results.csv sent');
+            await runAuxTask('download', 'Download all_results.csv', async () => {
+                await showResultsRootMenu(msg.chat.id, msg, '⬇️ Preparing all_results.csv...');
+                await sendDocumentFile(msg.chat.id, allResultsPath, '📄 all_results.csv');
+                await showResultsRootMenu(msg.chat.id, msg, '✅ all_results.csv sent');
+            });
         } catch (error) {
             console.error(`Failed to send all_results.csv: ${error.message}`);
             await showResultsRootMenu(msg.chat.id, msg, '❌ Failed to send all_results.csv');
@@ -1468,10 +1547,12 @@ bot.on('callback_query', async (callbackQuery) => {
         }
 
         await safeAnswerCallbackQuery(callbackQuery.id);
-        await showResultsRootMenu(msg.chat.id, msg, '⬇️ Preparing history.db backup...');
         try {
-            await sendDocumentFile(msg.chat.id, historyDbPath, '🗄️ history.db backup');
-            await showResultsRootMenu(msg.chat.id, msg, '✅ history.db backup sent');
+            await runAuxTask('download', 'Download history.db backup', async () => {
+                await showResultsRootMenu(msg.chat.id, msg, '⬇️ Preparing history.db backup...');
+                await sendDocumentFile(msg.chat.id, historyDbPath, '🗄️ history.db backup');
+                await showResultsRootMenu(msg.chat.id, msg, '✅ history.db backup sent');
+            });
         } catch (error) {
             console.error(`Failed to send history.db backup: ${error.message}`);
             await showResultsRootMenu(msg.chat.id, msg, '❌ Failed to send history.db backup');
@@ -1532,10 +1613,12 @@ bot.on('callback_query', async (callbackQuery) => {
         }
 
         await safeAnswerCallbackQuery(callbackQuery.id);
-        await showFolderFilesMenu(msg.chat.id, folderName, msg, `⬇️ Preparing ${fileName}...`);
         try {
-            await sendDocumentFile(msg.chat.id, filePath, `📄 ${folderName} / ${fileName}`);
-            await showFolderFilesMenu(msg.chat.id, folderName, msg, `✅ ${fileName} sent`);
+            await runAuxTask('download', `Download ${folderName}/${fileName}`, async () => {
+                await showFolderFilesMenu(msg.chat.id, folderName, msg, `⬇️ Preparing ${fileName}...`);
+                await sendDocumentFile(msg.chat.id, filePath, `📄 ${folderName} / ${fileName}`);
+                await showFolderFilesMenu(msg.chat.id, folderName, msg, `✅ ${fileName} sent`);
+            });
         } catch (error) {
             console.error(`Failed to send ${folderName}/${fileName}: ${error.message}`);
             await showFolderFilesMenu(msg.chat.id, folderName, msg, `❌ Failed to send ${fileName}`);
@@ -1668,8 +1751,13 @@ export const setBotStatus = (status, task = null) => {
 };
 
 export const getBotStatus = () => ({
-    status: botStatus,
+    status: botStatus !== 'idle' ? botStatus : (listRunningAuxTasks().length > 0 ? 'background_tasks' : 'idle'),
     task: currentTask,
+    auxTasks: listRunningAuxTasks().map(task => ({
+        id: task.id,
+        type: task.type,
+        label: task.label
+    }))
 });
 
 
