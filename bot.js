@@ -579,7 +579,7 @@ const safeEditMessageText = async (chatId, messageId, text) => {
     }
 };
 
-const LIVE_TRACKER_INTERVAL_MS = 60 * 1000;
+const LIVE_TRACKER_INTERVAL_MS = 10 * 1000;
 
 const pendingChatInputs = new Map();
 
