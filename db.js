@@ -21,6 +21,21 @@ db.exec(`
         parent_url TEXT,
         last_scanned TEXT
     );
+    CREATE TABLE IF NOT EXISTS tracked_pages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL UNIQUE,
+        type TEXT NOT NULL DEFAULT 'html',
+        output_base TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT,
+        last_run_at TEXT,
+        last_status TEXT,
+        last_new_urls INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
 `);
 
 // Add new column to scraped_urls if it doesn't exist (Migration)
@@ -42,6 +57,37 @@ const updateSitemapDateStmt = db.prepare('UPDATE discovered_sitemaps SET last_sc
 const checkStmt = db.prepare('SELECT 1 FROM scraped_urls WHERE url = ?');
 const getCountStmt = db.prepare('SELECT COUNT(*) as count FROM scraped_urls');
 const getSitemapCountStmt = db.prepare('SELECT COUNT(*) as count FROM discovered_sitemaps');
+const insertTrackedPageStmt = db.prepare(`
+    INSERT OR REPLACE INTO tracked_pages (
+        id,
+        url,
+        type,
+        output_base,
+        enabled,
+        created_at,
+        last_run_at,
+        last_status,
+        last_new_urls
+    ) VALUES (
+        COALESCE((SELECT id FROM tracked_pages WHERE url = ?), NULL),
+        ?, ?, ?, COALESCE((SELECT enabled FROM tracked_pages WHERE url = ?), 1),
+        COALESCE((SELECT created_at FROM tracked_pages WHERE url = ?), ?),
+        COALESCE((SELECT last_run_at FROM tracked_pages WHERE url = ?), NULL),
+        COALESCE((SELECT last_status FROM tracked_pages WHERE url = ?), NULL),
+        COALESCE((SELECT last_new_urls FROM tracked_pages WHERE url = ?), 0)
+    )
+`);
+const getTrackedPagesStmt = db.prepare('SELECT * FROM tracked_pages ORDER BY enabled DESC, url ASC');
+const getTrackedPageByIdStmt = db.prepare('SELECT * FROM tracked_pages WHERE id = ?');
+const updateTrackedPageEnabledStmt = db.prepare('UPDATE tracked_pages SET enabled = ? WHERE id = ?');
+const deleteTrackedPageStmt = db.prepare('DELETE FROM tracked_pages WHERE id = ?');
+const updateTrackedPageRunResultStmt = db.prepare(`
+    UPDATE tracked_pages
+    SET last_run_at = ?, last_status = ?, last_new_urls = ?
+    WHERE id = ?
+`);
+const getSettingStmt = db.prepare('SELECT value FROM app_settings WHERE key = ?');
+const upsertSettingStmt = db.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)');
 
 /**
  * Normalizes a URL by removing the trailing slash.
@@ -187,6 +233,105 @@ export function updateSitemapScanDate(url) {
  */
 export function getSitemapCount() {
     return getSitemapCountStmt.get().count;
+}
+
+export function getTrackedPages() {
+    return getTrackedPagesStmt.all();
+}
+
+export function getEnabledTrackedPages() {
+    return getTrackedPages().filter(row => Number(row.enabled) === 1);
+}
+
+export function getTrackedPageById(id) {
+    return getTrackedPageByIdStmt.get(id);
+}
+
+export function saveTrackedPage(url, type = 'html', outputBase = '') {
+    const normalizedUrl = normalizeUrl(String(url || '').trim());
+    const normalizedType = String(type || 'html').trim().toLowerCase() === 'rss' ? 'rss' : 'html';
+    const normalizedOutputBase = String(outputBase || '').trim();
+    const timestamp = new Date().toISOString();
+
+    insertTrackedPageStmt.run(
+        normalizedUrl,
+        normalizedUrl,
+        normalizedType,
+        normalizedOutputBase,
+        normalizedUrl,
+        normalizedUrl,
+        timestamp,
+        normalizedUrl,
+        normalizedUrl,
+        normalizedUrl
+    );
+
+    return db.prepare('SELECT * FROM tracked_pages WHERE url = ?').get(normalizedUrl);
+}
+
+export function setTrackedPageEnabled(id, enabled) {
+    updateTrackedPageEnabledStmt.run(enabled ? 1 : 0, id);
+    return getTrackedPageById(id);
+}
+
+export function deleteTrackedPage(id) {
+    deleteTrackedPageStmt.run(id);
+}
+
+export function updateTrackedPageRunResult(id, { lastRunAt, lastStatus, lastNewUrls }) {
+    updateTrackedPageRunResultStmt.run(
+        lastRunAt || new Date().toISOString(),
+        String(lastStatus || '').trim() || null,
+        Number.isFinite(Number(lastNewUrls)) ? Number(lastNewUrls) : 0,
+        id
+    );
+}
+
+function getSettingValue(key, fallback = null) {
+    const row = getSettingStmt.get(key);
+    if (!row || row.value === undefined || row.value === null) {
+        return fallback;
+    }
+    return row.value;
+}
+
+function setSettingValue(key, value) {
+    upsertSettingStmt.run(key, String(value));
+}
+
+export function getPageTrackerSchedule() {
+    const intervalHours = Number(getSettingValue('page_tracker_interval_hours', '1'));
+    const enabled = getSettingValue('page_tracker_enabled', '1') === '1';
+    return {
+        intervalHours: Number.isFinite(intervalHours) && intervalHours > 0 ? intervalHours : 1,
+        enabled
+    };
+}
+
+export function setPageTrackerSchedule(intervalHours, enabled = true) {
+    const normalizedHours = Math.max(1, Number(intervalHours) || 1);
+    setSettingValue('page_tracker_interval_hours', normalizedHours);
+    setSettingValue('page_tracker_enabled', enabled ? '1' : '0');
+    return getPageTrackerSchedule();
+}
+
+export function setPageTrackerEnabled(enabled) {
+    const current = getPageTrackerSchedule();
+    return setPageTrackerSchedule(current.intervalHours, enabled);
+}
+
+export function getPageTrackerLastSummary() {
+    const raw = getSettingValue('page_tracker_last_summary', '');
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+}
+
+export function savePageTrackerLastSummary(summary) {
+    setSettingValue('page_tracker_last_summary', JSON.stringify(summary || null));
 }
 
 /**
