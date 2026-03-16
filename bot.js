@@ -107,28 +107,102 @@ const listResultFoldersWithCsv = () => {
         .sort((a, b) => a.localeCompare(b));
 };
 
-const buildResultsRootKeyboard = () => {
-    const inlineKeyboard = [];
-    const allResultsPath = getAllResultsPath();
-    const historyDbPath = getHistoryDbPath();
+const RESULTS_ROOT_PAGE_SIZE = 8;
+const resultsViewStates = new Map();
 
-    if (fs.existsSync(allResultsPath)) {
+const getResultsViewState = (chatId) =>
+    resultsViewStates.get(chatId.toString()) || { page: 0, query: '' };
+
+const setResultsViewState = (chatId, state = {}) => {
+    const currentState = getResultsViewState(chatId);
+    const nextPage = Object.prototype.hasOwnProperty.call(state, 'page')
+        ? Math.max(0, Number(state.page) || 0)
+        : currentState.page;
+    const nextQuery = Object.prototype.hasOwnProperty.call(state, 'query')
+        ? String(state.query || '').trim()
+        : currentState.query;
+
+    resultsViewStates.set(chatId.toString(), {
+        page: nextPage,
+        query: nextQuery
+    });
+};
+
+const clearResultsViewState = (chatId) => {
+    resultsViewStates.set(chatId.toString(), { page: 0, query: '' });
+};
+
+const getResultsRootMenuState = (chatId) => {
+    const currentState = getResultsViewState(chatId);
+    const allFolders = listResultFoldersWithCsv();
+    const query = String(currentState.query || '').trim();
+    const normalizedQuery = query.toLowerCase();
+    const filteredFolders = normalizedQuery
+        ? allFolders.filter(folderName => folderName.toLowerCase().includes(normalizedQuery))
+        : allFolders;
+    const totalPages = Math.max(1, Math.ceil(filteredFolders.length / RESULTS_ROOT_PAGE_SIZE));
+    const safePage = filteredFolders.length === 0
+        ? 0
+        : Math.min(currentState.page || 0, totalPages - 1);
+
+    setResultsViewState(chatId, { page: safePage, query });
+
+    return {
+        query,
+        allFolders,
+        filteredFolders,
+        totalPages,
+        page: safePage,
+        pagedFolders: filteredFolders.slice(
+            safePage * RESULTS_ROOT_PAGE_SIZE,
+            (safePage + 1) * RESULTS_ROOT_PAGE_SIZE
+        ),
+        hasAllResults: fs.existsSync(getAllResultsPath()),
+        hasHistoryDb: fs.existsSync(getHistoryDbPath()),
+        hasAnyItem: fs.existsSync(getAllResultsPath()) || fs.existsSync(getHistoryDbPath()) || allFolders.length > 0
+    };
+};
+
+const buildResultsRootKeyboard = (menuState) => {
+    const inlineKeyboard = [];
+
+    if (menuState.hasAllResults) {
         inlineKeyboard.push([
             { text: '📄 all_results.csv', callback_data: 'results_root_all' }
         ]);
     }
 
-    if (fs.existsSync(historyDbPath)) {
+    if (menuState.hasHistoryDb) {
         inlineKeyboard.push([
             { text: '🗄️ history.db backup', callback_data: 'results_root_db' }
         ]);
     }
 
-    listResultFoldersWithCsv().forEach(folderName => {
+    if (menuState.allFolders.length > 0 || menuState.query) {
+        inlineKeyboard.push([
+            { text: '🔎 Search Domains', callback_data: 'results_search' }
+        ]);
+    }
+
+    menuState.pagedFolders.forEach(folderName => {
         inlineKeyboard.push([
             { text: `📁 ${folderName}`, callback_data: `results_folder:${folderName}` }
         ]);
     });
+
+    if (menuState.totalPages > 1) {
+        inlineKeyboard.push([
+            { text: '⬅️ Prev', callback_data: 'results_page:prev' },
+            { text: `📄 ${menuState.page + 1}/${menuState.totalPages}`, callback_data: 'results_page:stay' },
+            { text: 'Next ➡️', callback_data: 'results_page:next' }
+        ]);
+    }
+
+    if (menuState.query) {
+        inlineKeyboard.push([
+            { text: '❌ Clear Search', callback_data: 'results_search_clear' }
+        ]);
+    }
 
     inlineKeyboard.push([
         { text: '⬅️ Back to Home', callback_data: 'home_back' }
@@ -224,13 +298,24 @@ const showScrapeFileSelectionMenu = async (chatId, message = null) => {
 };
 
 const showResultsRootMenu = async (chatId, message = null, statusLine = '') => {
-    const keyboard = buildResultsRootKeyboard();
-    if (keyboard.inline_keyboard.length <= 1) {
+    const menuState = getResultsRootMenuState(chatId);
+    if (!menuState.hasAnyItem) {
         await sendOrEditMenu(chatId, 'No result or backup files are available yet.', undefined, message);
         return;
     }
 
+    const keyboard = buildResultsRootKeyboard(menuState);
     const lines = ['Select a result or backup file to download:'];
+    if (menuState.query) {
+        lines.push(`🔎 Filter: ${menuState.query}`);
+        lines.push(`Matches: ${menuState.filteredFolders.length}`);
+    }
+    if (menuState.totalPages > 1) {
+        lines.push(`📄 Page: ${menuState.page + 1}/${menuState.totalPages}`);
+    }
+    if (menuState.query && menuState.filteredFolders.length === 0) {
+        lines.push('No matching domains found.');
+    }
     if (statusLine) {
         lines.push(statusLine);
     }
@@ -1828,6 +1913,23 @@ bot.on('message', async (msg) => {
         return;
     }
 
+    if (pendingInput.type === 'results_search') {
+        const query = String(msg.text || '').trim();
+        if (!query) {
+            await sendPlainMessage('Send part of a domain name to search.', msg.chat.id);
+            return;
+        }
+
+        clearPendingChatInput(msg.chat.id);
+        setResultsViewState(msg.chat.id, { query, page: 0 });
+        await showResultsRootMenu(
+            msg.chat.id,
+            pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
+            `🔎 Showing results for "${query}"`
+        );
+        return;
+    }
+
     if (pendingInput.type === 'upload_txt') {
         await sendPlainMessage('Please send a .txt or .csv file.', msg.chat.id);
         return;
@@ -2175,6 +2277,7 @@ bot.on('callback_query', async (callbackQuery) => {
 
     if (data === 'home_open:download_results') {
         await safeAnswerCallbackQuery(callbackQuery.id);
+        clearResultsViewState(msg.chat.id);
         await showResultsRootMenu(msg.chat.id, msg);
         return;
     }
@@ -2486,6 +2589,45 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
     }
 
+    if (data === 'results_search') {
+        setPendingChatInput(msg.chat.id, {
+            type: 'results_search',
+            menuMessageId: msg.message_id
+        });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showResultsRootMenu(msg.chat.id, msg, '🔎 Send part of a domain name in your next message.');
+        return;
+    }
+
+    if (data === 'results_search_clear') {
+        clearResultsViewState(msg.chat.id);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showResultsRootMenu(msg.chat.id, msg, '✅ Search cleared');
+        return;
+    }
+
+    if (data.startsWith('results_page:')) {
+        const direction = path.basename(data.replace('results_page:', ''));
+        const currentState = getResultsViewState(msg.chat.id);
+
+        if (direction === 'prev') {
+            setResultsViewState(msg.chat.id, { page: Math.max(0, (currentState.page || 0) - 1) });
+            await safeAnswerCallbackQuery(callbackQuery.id);
+            await showResultsRootMenu(msg.chat.id, msg);
+            return;
+        }
+
+        if (direction === 'next') {
+            setResultsViewState(msg.chat.id, { page: (currentState.page || 0) + 1 });
+            await safeAnswerCallbackQuery(callbackQuery.id);
+            await showResultsRootMenu(msg.chat.id, msg);
+            return;
+        }
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        return;
+    }
+
     if (data === 'results_root_db') {
         const historyDbPath = getHistoryDbPath();
         if (!fs.existsSync(historyDbPath)) {
@@ -2661,6 +2803,7 @@ bot.onText(/\/download_results/, async (msg) => {
         return;
     }
 
+    clearResultsViewState(msg.chat.id);
     await showResultsRootMenu(msg.chat.id);
 });
 
