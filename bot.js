@@ -171,7 +171,8 @@ const sendOrEditMenu = async (chatId, text, replyMarkup, message = null) => {
             await bot.editMessageText(text, {
                 chat_id: chatId,
                 message_id: message.message_id,
-                reply_markup: replyMarkup
+                reply_markup: replyMarkup,
+                disable_web_page_preview: true
             });
             return;
         } catch (error) {
@@ -182,7 +183,10 @@ const sendOrEditMenu = async (chatId, text, replyMarkup, message = null) => {
         }
     }
 
-    await bot.sendMessage(chatId, text, { reply_markup: replyMarkup });
+    await bot.sendMessage(chatId, text, {
+        reply_markup: replyMarkup,
+        disable_web_page_preview: true
+    });
 };
 
 const showHomeMenu = async (chatId, message = null) => {
@@ -479,8 +483,8 @@ const formatTrackedPageShortLabel = (url, type) => {
 
 const buildPageTrackerMenuKeyboard = () => ({
     inline_keyboard: [
-        [{ text: '➕ Add Tracked URL', callback_data: 'page_tracker_add' }],
-        [{ text: '📋 View Tracked URLs', callback_data: 'page_tracker_list' }],
+        [{ text: '➕ Add Website Page', callback_data: 'page_tracker_add' }],
+        [{ text: '📋 View Tracked Pages', callback_data: 'page_tracker_list' }],
         [{ text: '▶️ Run Tracker Now', callback_data: 'page_tracker_run_all' }],
         [{ text: '⏱ Tracker Schedule', callback_data: 'page_tracker_schedule' }],
         [{ text: '📊 Last Tracker Summary', callback_data: 'page_tracker_last_summary' }],
@@ -605,8 +609,8 @@ const buildPageTrackerMenuText = () => {
     const trackedPages = getTrackedPages();
 
     return [
-        'Page Tracker',
-        `Tracked URLs: ${trackedPages.length}`,
+        'Website Page Tracker',
+        `Tracked Pages: ${trackedPages.length}`,
         `Enabled: ${trackedPages.filter(page => Number(page.enabled) === 1).length}`,
         `Schedule: ${schedule.enabled ? `Every ${schedule.intervalHours} hour${schedule.intervalHours === 1 ? '' : 's'}` : 'Paused'}`
     ].join('\n');
@@ -628,13 +632,14 @@ const buildPageTrackerScheduleText = (statusLine = '') => {
 };
 
 const buildTrackedPageDetailText = (page, statusLine = '') => {
+    const schedule = getPageTrackerSchedule();
     const lines = [
-        'Tracked URL',
+        'Tracked Website Page',
         `URL: ${page.url}`,
-        `Type: ${formatTrackedPageTypeLabel(page.type)}`,
         `Status: ${Number(page.enabled) === 1 ? 'Enabled' : 'Paused'}`,
+        `Checks Every: ${schedule.intervalHours} hour${schedule.intervalHours === 1 ? '' : 's'}`,
         `Last Run: ${page.last_run_at || 'Never'}`,
-        `Last Result: ${page.last_status ? `${page.last_status} • ${page.last_new_urls || 0} new URL(s)` : 'Never'}`
+        `Last New URLs: ${page.last_status ? (page.last_new_urls || 0) : 'Never'}`
     ];
 
     if (statusLine) {
@@ -698,11 +703,11 @@ const showPageTrackerMenu = async (chatId, message = null) => {
 const showTrackedPagesMenu = async (chatId, message = null) => {
     const pages = getTrackedPages();
     if (pages.length === 0) {
-        await sendOrEditMenu(chatId, 'No tracked URLs yet.', buildPageTrackerMenuKeyboard(), message);
+        await sendOrEditMenu(chatId, 'No tracked website pages yet.', buildPageTrackerMenuKeyboard(), message);
         return;
     }
 
-    await sendOrEditMenu(chatId, 'Tracked URLs:', buildTrackedPagesKeyboard(), message);
+    await sendOrEditMenu(chatId, 'Tracked Website Pages:', buildTrackedPagesKeyboard(), message);
 };
 
 const showTrackedPageDetail = async (chatId, pageId, message = null, statusLine = '') => {
@@ -804,7 +809,8 @@ const safeEditMessageText = async (chatId, messageId, text) => {
     try {
         await bot.editMessageText(text, {
             chat_id: chatId,
-            message_id: messageId
+            message_id: messageId,
+            disable_web_page_preview: true
         });
     } catch (error) {
         const description = error?.response?.body?.description || error?.message || '';
@@ -1647,16 +1653,13 @@ bot.on('message', async (msg) => {
         }
 
         clearPendingChatInput(msg.chat.id);
-        setPendingTrackedPageAdd(msg.chat.id, {
-            url: inputUrl,
-            menuMessageId: pendingInput.menuMessageId || null
-        });
-
-        await sendOrEditMenu(
+        clearPendingTrackedPageAdd(msg.chat.id);
+        const savedPage = saveTrackedPage(inputUrl, 'html');
+        await showTrackedPageDetail(
             msg.chat.id,
-            `Select tracker type for:\n${inputUrl}`,
-            buildPageTrackerAddTypeKeyboard(),
-            pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null
+            savedPage.id,
+            pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
+            '✅ Website page added for tracking'
         );
         return;
     }
@@ -1771,7 +1774,7 @@ bot.on('callback_query', async (callbackQuery) => {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await sendOrEditMenu(
             msg.chat.id,
-            'Add Tracked URL\n\nSend the page or feed URL in your next message.',
+            'Add Website Page\n\nSend the website homepage or category page URL in your next message.\n\nExamples:\nhttps://nyweekly.com/\nhttps://nyweekly.com/category/business/',
             buildPageTrackerMenuKeyboard(),
             msg
         );
