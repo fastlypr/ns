@@ -170,6 +170,55 @@ export function buildTrackedPageEntry(entry) {
     };
 }
 
+export async function extractTrackedPageUrlsFromSitemap(sitemapUrl, options = {}) {
+    const { timeoutMs = 30000, retryLimit = 2, maxNestedSitemaps = 20 } = options;
+    const visited = new Set();
+    const discoveredUrls = new Set();
+
+    const fetchSitemap = async (url, depth = 0) => {
+        if (visited.has(url)) return;
+        visited.add(url);
+
+        const xml = await fetchText(url, { timeoutMs, retryLimit });
+        const $ = cheerio.load(xml, { xmlMode: true });
+
+        const pageUrls = $('url > loc')
+            .map((_, el) => ($(el).text() || '').trim())
+            .get()
+            .filter(Boolean);
+
+        if (pageUrls.length > 0) {
+            for (const rawUrl of pageUrls) {
+                try {
+                    discoveredUrls.add(normalizeUrl(rawUrl, url, false));
+                } catch {
+                }
+            }
+            return;
+        }
+
+        if (depth >= 1) {
+            return;
+        }
+
+        const nestedSitemaps = $('sitemap > loc')
+            .map((_, el) => ($(el).text() || '').trim())
+            .get()
+            .filter(Boolean)
+            .slice(0, maxNestedSitemaps);
+
+        for (const nestedUrl of nestedSitemaps) {
+            try {
+                await fetchSitemap(normalizeUrl(nestedUrl, url, true), depth + 1);
+            } catch {
+            }
+        }
+    };
+
+    await fetchSitemap(String(sitemapUrl || '').trim(), 0);
+    return Array.from(discoveredUrls).sort((a, b) => a.localeCompare(b));
+}
+
 function parseTrackedLine(line) {
     const trimmed = line.trim();
     if (!trimmed) return null;

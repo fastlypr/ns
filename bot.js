@@ -2,6 +2,8 @@ import TelegramBot from 'node-telegram-bot-api';
 import { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } from './config.js';
 import fs from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import {
     scrapeSingleUrlAndProcess,
     scrapeUrlsFromInputFile,
@@ -16,12 +18,13 @@ import {
     testProxyProvider
 } from './scraper.js';
 import { runSitemapScraper, runBulkSitemapScraper, rescanSavedSitemaps } from './xml.js';
-import { runTrackedPagesOnce } from './rss.js';
+import { runTrackedPagesOnce, extractTrackedPageUrlsFromSitemap } from './rss.js';
 import {
     getAllSitemaps,
     getHistoryCount,
     exportUrlsByStatus,
     getUrlsByStatus,
+    normalizeUrl as normalizeDbUrl,
     getTrackedPages,
     getEnabledTrackedPages,
     getTrackedPageById,
@@ -64,6 +67,9 @@ const RETRY_OPTIONS = {
 };
 
 const PAGE_TRACKER_INTERVAL_OPTIONS = [1, 2, 6];
+const execFileAsync = promisify(execFile);
+const DEPLOY_STATUS_FILE = path.join(process.cwd(), '.deploy_status.json');
+const DEPLOY_SCRIPT_PATH = path.join(process.cwd(), 'deploy_bot.sh');
 
 const getResultDirPath = () => path.join(process.cwd(), 'result');
 
@@ -484,6 +490,7 @@ const formatTrackedPageShortLabel = (url, type) => {
 const buildPageTrackerMenuKeyboard = () => ({
     inline_keyboard: [
         [{ text: '➕ Add Website Page', callback_data: 'page_tracker_add' }],
+        [{ text: '📥 Import Page Sitemap', callback_data: 'page_tracker_import_sitemap' }],
         [{ text: '📋 View Tracked Pages', callback_data: 'page_tracker_list' }],
         [{ text: '▶️ Run Tracker Now', callback_data: 'page_tracker_run_all' }],
         [{ text: '⏱ Tracker Schedule', callback_data: 'page_tracker_schedule' }],
@@ -548,6 +555,7 @@ const buildSystemMenuKeyboard = () => ({
         [{ text: '📡 Bot Status', callback_data: 'home_view:status' }],
         [{ text: '📈 Statistics', callback_data: 'home_view:stats' }],
         [{ text: '🛡️ Proxy Mode', callback_data: 'home_open:proxy_mode' }],
+        [{ text: '⬆️ Update & Restart', callback_data: 'home_action:deploy_update' }],
         [{ text: '❓ Help', callback_data: 'home_view:help' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
@@ -604,16 +612,21 @@ const buildProxyMenuText = (statusLine = '') => {
     return lines.join('\n');
 };
 
-const buildPageTrackerMenuText = () => {
+const buildPageTrackerMenuText = (statusLine = '') => {
     const schedule = getPageTrackerSchedule();
     const trackedPages = getTrackedPages();
-
-    return [
+    const lines = [
         'Website Page Tracker',
         `Tracked Pages: ${trackedPages.length}`,
         `Enabled: ${trackedPages.filter(page => Number(page.enabled) === 1).length}`,
         `Schedule: ${schedule.enabled ? `Every ${schedule.intervalHours} hour${schedule.intervalHours === 1 ? '' : 's'}` : 'Paused'}`
-    ].join('\n');
+    ];
+
+    if (statusLine) {
+        lines.push('', statusLine);
+    }
+
+    return lines.join('\n');
 };
 
 const buildPageTrackerScheduleText = (statusLine = '') => {
@@ -696,8 +709,95 @@ const buildLastPageTrackerSummaryText = () => {
     ].join('\n');
 };
 
-const showPageTrackerMenu = async (chatId, message = null) => {
-    await sendOrEditMenu(chatId, buildPageTrackerMenuText(), buildPageTrackerMenuKeyboard(), message);
+const importTrackedPagesFromSitemap = async (sitemapUrl) => {
+    const existingUrls = new Set(getTrackedPages().map(page => normalizeDbUrl(page.url)));
+    const importedUrls = await extractTrackedPageUrlsFromSitemap(sitemapUrl);
+
+    let addedCount = 0;
+    let skippedCount = 0;
+
+    importedUrls.forEach(url => {
+        const normalizedUrl = normalizeDbUrl(url);
+        if (existingUrls.has(normalizedUrl)) {
+            skippedCount += 1;
+            return;
+        }
+
+        saveTrackedPage(normalizedUrl, 'html');
+        existingUrls.add(normalizedUrl);
+        addedCount += 1;
+    });
+
+    return {
+        sitemapUrl,
+        totalFound: importedUrls.length,
+        addedCount,
+        skippedCount
+    };
+};
+
+const notifyDeployStatusIfPresent = async () => {
+    if (!fs.existsSync(DEPLOY_STATUS_FILE)) {
+        return;
+    }
+
+    try {
+        const raw = fs.readFileSync(DEPLOY_STATUS_FILE, 'utf8');
+        const status = JSON.parse(raw);
+        const lines = [];
+
+        if (status.status === 'restarting') {
+            lines.push('✅ Bot update complete');
+        } else if (status.status === 'failed') {
+            lines.push('❌ Bot update failed');
+        } else {
+            lines.push('ℹ️ Bot update status');
+        }
+
+        if (status.fromCommit) lines.push(`From: ${status.fromCommit}`);
+        if (status.toCommit) lines.push(`To: ${status.toCommit}`);
+        if (status.step) lines.push(`Step: ${status.step}`);
+        if (status.updatedAt) lines.push(`Time: ${status.updatedAt}`);
+
+        await sendPlainMessage(lines.join('\n'), TELEGRAM_CHAT_ID);
+    } catch (error) {
+        console.error(`Failed to report deploy status: ${error.message}`);
+    } finally {
+        try {
+            fs.unlinkSync(DEPLOY_STATUS_FILE);
+        } catch (error) {
+            console.error(`Failed to clear deploy status file: ${error.message}`);
+        }
+    }
+};
+
+const runDeployUpdate = async (chatId, message = null) => {
+    await sendOrEditMenu(
+        chatId,
+        'Starting update from GitHub...\nThe bot will restart automatically if the update succeeds.',
+        buildSystemMenuKeyboard(),
+        message
+    );
+
+    try {
+        await runAuxTask('deploy', 'Update & Restart bot', async () => {
+            await execFileAsync('bash', [DEPLOY_SCRIPT_PATH], { cwd: process.cwd() });
+        });
+    } catch (error) {
+        const stderr = error?.stderr ? String(error.stderr).trim() : '';
+        const stdout = error?.stdout ? String(error.stdout).trim() : '';
+        const details = stderr || stdout || error.message || 'Unknown error';
+        await sendOrEditMenu(
+            chatId,
+            `❌ Update failed\n${details}`,
+            buildSystemMenuKeyboard(),
+            message
+        );
+    }
+};
+
+const showPageTrackerMenu = async (chatId, message = null, statusLine = '') => {
+    await sendOrEditMenu(chatId, buildPageTrackerMenuText(statusLine), buildPageTrackerMenuKeyboard(), message);
 };
 
 const showTrackedPagesMenu = async (chatId, message = null) => {
@@ -1472,6 +1572,9 @@ const withBotStatus = async (status, task, action) => {
 };
 
 startPageTrackerScheduler();
+notifyDeployStatusIfPresent().catch(error => {
+    console.error(`Failed to process deploy status notification: ${error.message}`);
+});
 
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
@@ -1654,6 +1757,25 @@ bot.on('message', async (msg) => {
 
         clearPendingChatInput(msg.chat.id);
         clearPendingTrackedPageAdd(msg.chat.id);
+
+        if (looksLikeSitemapUrl(inputUrl)) {
+            try {
+                const result = await importTrackedPagesFromSitemap(inputUrl);
+                await showPageTrackerMenu(
+                    msg.chat.id,
+                    pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
+                    `✅ Imported ${result.addedCount} page URL(s) from sitemap. Skipped ${result.skippedCount} existing URL(s).`
+                );
+            } catch (error) {
+                await showPageTrackerMenu(
+                    msg.chat.id,
+                    pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
+                    `❌ Failed to import page sitemap: ${error.message}`
+                );
+            }
+            return;
+        }
+
         const savedPage = saveTrackedPage(inputUrl, 'html');
         await showTrackedPageDetail(
             msg.chat.id,
@@ -1661,6 +1783,34 @@ bot.on('message', async (msg) => {
             pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
             '✅ Website page added for tracking'
         );
+        return;
+    }
+
+    if (pendingInput.type === 'page_tracker_import_sitemap') {
+        const inputUrl = String(msg.text || '').trim();
+        try {
+            new URL(inputUrl);
+        } catch (error) {
+            await sendPlainMessage('Please send a valid sitemap URL.', msg.chat.id);
+            return;
+        }
+
+        clearPendingChatInput(msg.chat.id);
+
+        try {
+            const result = await importTrackedPagesFromSitemap(inputUrl);
+            await showPageTrackerMenu(
+                msg.chat.id,
+                pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
+                `✅ Imported ${result.addedCount} page URL(s) from sitemap. Skipped ${result.skippedCount} existing URL(s).`
+            );
+        } catch (error) {
+            await showPageTrackerMenu(
+                msg.chat.id,
+                pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
+                `❌ Failed to import page sitemap: ${error.message}`
+            );
+        }
         return;
     }
 
@@ -1775,6 +1925,22 @@ bot.on('callback_query', async (callbackQuery) => {
         await sendOrEditMenu(
             msg.chat.id,
             'Add Website Page\n\nSend the website homepage or category page URL in your next message.\n\nExamples:\nhttps://nyweekly.com/\nhttps://nyweekly.com/category/business/',
+            buildPageTrackerMenuKeyboard(),
+            msg
+        );
+        return;
+    }
+
+    if (data === 'page_tracker_import_sitemap') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        setPendingChatInput(msg.chat.id, {
+            type: 'page_tracker_import_sitemap',
+            menuMessageId: msg.message_id
+        });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            'Import Page Sitemap\n\nSend a page sitemap URL in your next message.\n\nExample:\nhttps://nyweekly.com/page-sitemap.xml',
             buildPageTrackerMenuKeyboard(),
             msg
         );
@@ -2148,6 +2314,12 @@ bot.on('callback_query', async (callbackQuery) => {
             ],
             msg
         );
+        return;
+    }
+
+    if (data === 'home_action:deploy_update') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await runDeployUpdate(msg.chat.id, msg);
         return;
     }
 
