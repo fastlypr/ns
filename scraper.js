@@ -717,6 +717,8 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
     ensureScraperInitialized();
     const { onProgress } = options;
     const startedAt = Date.now();
+    const linkedinLeadSet = new Set();
+    const instagramLeadSet = new Set();
     const progress = {
         totalUrls: urls.length,
         processedUrls: 0,
@@ -724,6 +726,10 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
         failedCount: 0,
         noResultCount: 0,
         skippedCount: 0,
+        linkedinLeadCount: 0,
+        instagramLeadCount: 0,
+        linkedinLeadKeys: [],
+        instagramLeadKeys: [],
         currentUrl: '',
         elapsedMs: 0,
         sourceFilePath
@@ -789,6 +795,23 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
         console.log(`🔗 Source: ${result.source_url}`);
         
         if (result.socials.length > 0) {
+            result.socials.forEach((social) => {
+                if (!social || !social.link) return;
+
+                if (social.platform === 'linkedin') {
+                    linkedinLeadSet.add(social.link.toLowerCase());
+                }
+
+                if (social.platform === 'instagram') {
+                    const instagramUsername = extractUsername(social.link);
+                    instagramLeadSet.add((instagramUsername || social.link).toLowerCase());
+                }
+            });
+
+            progress.linkedinLeadCount = linkedinLeadSet.size;
+            progress.instagramLeadCount = instagramLeadSet.size;
+            progress.linkedinLeadKeys = Array.from(linkedinLeadSet);
+            progress.instagramLeadKeys = Array.from(instagramLeadSet);
             logScrapeResult(url, 'Success', `Found ${result.socials.length} links`);
             console.log(`✅ Found ${result.socials.length} social media links:`);
             result.socials.forEach(item => {
@@ -925,6 +948,8 @@ export async function processToScrapeFolder(toScrapeDir, options = {}) {
             failedCount: 0,
             noResultCount: 0,
             skippedCount: 0,
+            linkedinLeadCount: 0,
+            instagramLeadCount: 0,
             currentUrl: '',
             elapsedMs: 0
         };
@@ -937,6 +962,8 @@ export async function processToScrapeFolder(toScrapeDir, options = {}) {
         let completedFailed = 0;
         let completedNoResult = 0;
         let completedSkipped = 0;
+        const completedLinkedinLeadSet = new Set();
+        const completedInstagramLeadSet = new Set();
 
         for (const entry of fileEntries) {
             summary.currentFile = entry.file;
@@ -951,6 +978,14 @@ export async function processToScrapeFolder(toScrapeDir, options = {}) {
                     summary.failedCount = completedFailed + (progress.failedCount || 0);
                     summary.noResultCount = completedNoResult + (progress.noResultCount || 0);
                     summary.skippedCount = completedSkipped + (progress.skippedCount || 0);
+                    summary.linkedinLeadCount = new Set([
+                        ...completedLinkedinLeadSet,
+                        ...((progress.linkedinLeadKeys || []).map(key => key.toLowerCase()))
+                    ]).size;
+                    summary.instagramLeadCount = new Set([
+                        ...completedInstagramLeadSet,
+                        ...((progress.instagramLeadKeys || []).map(key => key.toLowerCase()))
+                    ]).size;
                     summary.currentUrl = progress.currentUrl || '';
                     summary.elapsedMs = Date.now() - startedAt;
                     await emitProgress({ stage: progress.stage || 'progress', summary: { ...summary } });
@@ -963,6 +998,8 @@ export async function processToScrapeFolder(toScrapeDir, options = {}) {
                 completedFailed += fileSummary.failedCount || 0;
                 completedNoResult += fileSummary.noResultCount || 0;
                 completedSkipped += fileSummary.skippedCount || 0;
+                (fileSummary.linkedinLeadKeys || []).forEach(key => completedLinkedinLeadSet.add(key.toLowerCase()));
+                (fileSummary.instagramLeadKeys || []).forEach(key => completedInstagramLeadSet.add(key.toLowerCase()));
             }
 
             summary.processedFiles += 1;
@@ -971,6 +1008,8 @@ export async function processToScrapeFolder(toScrapeDir, options = {}) {
             summary.failedCount = completedFailed;
             summary.noResultCount = completedNoResult;
             summary.skippedCount = completedSkipped;
+            summary.linkedinLeadCount = completedLinkedinLeadSet.size;
+            summary.instagramLeadCount = completedInstagramLeadSet.size;
             summary.currentUrl = '';
             summary.elapsedMs = Date.now() - startedAt;
 

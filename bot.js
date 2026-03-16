@@ -1033,6 +1033,8 @@ const buildFileScrapeProgressText = (fileName, summary) => {
         `📄 ${fileName}`,
         `${buildProgressBar(summary.processedUrls, summary.totalUrls)} ${percent}%  •  ${summary.processedUrls}/${summary.totalUrls}`,
         `⏱ ${formatElapsed(summary.elapsedMs)}  •  ✅ ${summary.successCount}  •  ❌ ${summary.failedCount}  •  ⚠️ ${summary.noResultCount}`,
+        `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
+        `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `🔗 ${shortenText(summary.currentUrl)}`
     ].join('\n');
 };
@@ -1045,6 +1047,8 @@ const buildFileScrapeSummaryText = (fileName, summary) => {
         `Success: ${summary.successCount}`,
         `Failed: ${summary.failedCount}`,
         `No Result: ${summary.noResultCount}`,
+        `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
+        `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `Skipped: ${summary.skippedCount}`,
         `Elapsed: ${formatElapsed(summary.elapsedMs)}`
     ].join('\n');
@@ -1069,6 +1073,8 @@ const buildFolderScrapeProgressText = (summary) => {
         `✅ Success: ${summary.successCount}`,
         `❌ Failed: ${summary.failedCount}`,
         `⚠️ No Result: ${summary.noResultCount}`,
+        `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
+        `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
         '',
         `🔗 Current: ${summary.currentUrl || '-'}`,
@@ -1085,13 +1091,15 @@ const buildFolderScrapeSummaryText = (summary) => {
         `Success: ${summary.successCount}`,
         `Failed: ${summary.failedCount}`,
         `No Result: ${summary.noResultCount}`,
+        `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
+        `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `Elapsed: ${formatElapsed(summary.elapsedMs)}`
     ].join('\n');
 };
 
 const runTrackedFileScrape = async (chatId, filePath) => {
     const fileName = path.basename(filePath);
-    let trackerMessage = await sendPlainMessage(`📄 ${fileName}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n🔗 -`, chatId);
+    let trackerMessage = await sendPlainMessage(`📄 ${fileName}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n👔 LinkedIn Leads: 0\n📸 Instagram Leads: 0\n🔗 -`, chatId);
     let lastTrackerUpdateAt = 0;
 
     const updateTracker = async (summary, force = false) => {
@@ -1175,7 +1183,7 @@ const runTrackedFolderScrape = async (chatId, toScrapeDir) => {
 };
 
 const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
-    let trackerMessage = await sendPlainMessage(`📄 ${label}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n🔗 -`, chatId);
+    let trackerMessage = await sendPlainMessage(`📄 ${label}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n👔 LinkedIn Leads: 0\n📸 Instagram Leads: 0\n🔗 -`, chatId);
     let lastTrackerUpdateAt = 0;
 
     const updateTracker = async (summary, force = false) => {
@@ -1223,6 +1231,8 @@ const buildRetryProgressText = (targetLabel, typeLabel, summary) => {
         `✅ Success: ${summary.successCount}`,
         `❌ Failed: ${summary.failedCount}`,
         `⚠️ No Result: ${summary.noResultCount}`,
+        `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
+        `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
         '',
         `🔗 Current: ${summary.currentUrl || '-'}`,
@@ -1239,6 +1249,8 @@ const buildRetrySummaryText = (targetLabel, typeLabel, summary) => {
         `Success: ${summary.successCount}`,
         `Failed: ${summary.failedCount}`,
         `No Result: ${summary.noResultCount}`,
+        `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
+        `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `Elapsed: ${formatElapsed(summary.elapsedMs)}`
     ].join('\n');
 };
@@ -1250,6 +1262,8 @@ const runTrackedRetryScrape = async (chatId, targetLabel, typeLabel, urls) => {
         successCount: 0,
         failedCount: 0,
         noResultCount: 0,
+        linkedinLeadCount: 0,
+        instagramLeadCount: 0,
         currentUrl: '',
         elapsedMs: 0
     };
