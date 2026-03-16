@@ -149,6 +149,27 @@ function outputBaseFromStartUrl(startUrl) {
     return `${base}_rss`;
 }
 
+function normalizeTrackedPageType(type) {
+    const normalized = String(type || 'html').trim().toLowerCase();
+    return normalized === 'rss' || normalized === 'atom' ? 'rss' : 'html';
+}
+
+export function buildTrackedPageEntry(entry) {
+    const startUrl = String(entry?.startUrl || entry?.url || '').trim();
+    const type = normalizeTrackedPageType(entry?.type || 'html');
+    const outputFileBase = String(entry?.outputFileBase || entry?.outputBase || entry?.output_base || outputBaseFromStartUrl(startUrl)).trim();
+    const name = String(entry?.name || `${outputFileBase}:${trimTrailingSlash(new URL(startUrl).pathname || '/')}`).trim();
+
+    return {
+        ...entry,
+        name,
+        type,
+        startUrl,
+        outputFileBase,
+        aggressiveLinkExtraction: entry?.aggressiveLinkExtraction ?? true
+    };
+}
+
 function parseTrackedLine(line) {
     const trimmed = line.trim();
     if (!trimmed) return null;
@@ -195,7 +216,7 @@ function parseTrackedLine(line) {
     }
 
     const name = `${outputFileBase}:${trimTrailingSlash(new URL(startUrl).pathname || '/')}`;
-    return { name, type, startUrl, outputFileBase, aggressiveLinkExtraction: true };
+    return buildTrackedPageEntry({ name, type, startUrl, outputFileBase, aggressiveLinkExtraction: true });
 }
 
 function loadTrackedPagesFromUrlsFile(filePath) {
@@ -601,7 +622,15 @@ async function processHtmlTrackedPage(entry, configDefaults, state) {
         existing.sourcePaths.add(sourcePath);
     }
 
-    return { outputBase, rows: Array.from(byUrl.values()) };
+    return {
+        outputBase,
+        rows: Array.from(byUrl.values()),
+        newUrlsCount: newlyDiscovered.length,
+        queuePath,
+        sourceName: name,
+        sourceUrl: startUrl,
+        trackedPageId: entry.id ?? null
+    };
 }
 
 async function processRssTrackedPage(entry, configDefaults, state) {
@@ -684,37 +713,55 @@ async function processRssTrackedPage(entry, configDefaults, state) {
         log('INFO', `No new URLs found for ${name}`);
     }
 
-    return { outputBase, rows: rssRows };
+    return {
+        outputBase,
+        rows: rssRows,
+        newUrlsCount: newlyDiscovered.length,
+        queuePath,
+        sourceName: name,
+        sourceUrl: startUrl,
+        trackedPageId: entry.id ?? null
+    };
 }
 
-async function runOnce({ configPath, urlsFile }) {
-    const config = loadConfig(configPath);
-    const configDefaults = config.defaults ?? {};
-    const tracked = urlsFile
-        ? loadTrackedPagesFromUrlsFile(urlsFile)
-        : (Array.isArray(config.trackedPages) ? config.trackedPages : []);
+async function runTrackedEntries({ tracked, configDefaults, state, scrapedAt, concurrency, onProgress }) {
+    const startedAt = Date.now();
+    const emitProgress = async (payload) => {
+        if (typeof onProgress === 'function') {
+            await onProgress(payload);
+        }
+    };
 
-    if (tracked.length === 0) {
-        log('ERROR', 'No trackedPages found in config.');
-        process.exitCode = 1;
-        return;
-    }
-
-    const state = loadState();
-    if (!state.seen) state.seen = {};
-
-    const scrapedAt = formatScrapedAt();
     const aggregatedByOutput = new Map();
-    const concurrency = urlsFile ? 1 : Math.max(1, Number(config.concurrency ?? 2));
     const queue = [...tracked];
+    const summary = {
+        totalSources: tracked.length,
+        processedSources: 0,
+        currentName: tracked[0]?.name || '',
+        currentUrl: tracked[0]?.startUrl || '',
+        newUrlsFound: 0,
+        queuedFiles: 0,
+        errors: 0,
+        elapsedMs: 0,
+        sourceSummaries: []
+    };
+
+    summary.elapsedMs = Date.now() - startedAt;
+    await emitProgress({ stage: 'start', summary: { ...summary } });
+
     const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
         while (queue.length > 0) {
             const entry = queue.shift();
             if (!entry) return;
             const type = (entry.type || 'html').toLowerCase();
+            summary.currentName = entry.name || entry.startUrl;
+            summary.currentUrl = entry.startUrl || '';
+            summary.elapsedMs = Date.now() - startedAt;
+            await emitProgress({ stage: 'scanning', summary: { ...summary } });
             try {
+                let result = null;
                 if (type === 'rss' || type === 'atom') {
-                    const result = await processRssTrackedPage(entry, configDefaults, state);
+                    result = await processRssTrackedPage(entry, configDefaults, state);
                     if (result?.outputBase) {
                         if (!aggregatedByOutput.has(result.outputBase)) aggregatedByOutput.set(result.outputBase, new Map());
                         const map = aggregatedByOutput.get(result.outputBase);
@@ -729,7 +776,7 @@ async function runOnce({ configPath, urlsFile }) {
                         }
                     }
                 } else {
-                    const result = await processHtmlTrackedPage(entry, configDefaults, state);
+                    result = await processHtmlTrackedPage(entry, configDefaults, state);
                     if (result?.outputBase) {
                         if (!aggregatedByOutput.has(result.outputBase)) aggregatedByOutput.set(result.outputBase, new Map());
                         const map = aggregatedByOutput.get(result.outputBase);
@@ -744,8 +791,33 @@ async function runOnce({ configPath, urlsFile }) {
                         }
                     }
                 }
+
+                summary.newUrlsFound += result?.newUrlsCount || 0;
+                summary.queuedFiles += result?.queuePath ? 1 : 0;
+                summary.sourceSummaries.push({
+                    trackedPageId: result?.trackedPageId ?? entry.id ?? null,
+                    name: result?.sourceName || entry.name || entry.startUrl,
+                    startUrl: result?.sourceUrl || entry.startUrl,
+                    status: 'success',
+                    newUrlsCount: result?.newUrlsCount || 0,
+                    queuePath: result?.queuePath || null
+                });
             } catch (err) {
                 log('ERROR', `Unhandled error for ${entry.name || entry.startUrl}`, err?.message || String(err));
+                summary.errors += 1;
+                summary.sourceSummaries.push({
+                    trackedPageId: entry.id ?? null,
+                    name: entry.name || entry.startUrl,
+                    startUrl: entry.startUrl,
+                    status: 'error',
+                    newUrlsCount: 0,
+                    queuePath: null,
+                    error: err?.message || String(err)
+                });
+            } finally {
+                summary.processedSources += 1;
+                summary.elapsedMs = Date.now() - startedAt;
+                await emitProgress({ stage: 'progress', summary: { ...summary } });
             }
         }
     });
@@ -758,6 +830,54 @@ async function runOnce({ configPath, urlsFile }) {
         }
     }
     saveState(state);
+    summary.elapsedMs = Date.now() - startedAt;
+    await emitProgress({ stage: 'complete', summary: { ...summary } });
+    return summary;
+}
+
+export async function runTrackedPagesOnce({ configPath = getDefaultConfigPath(), trackedPages = null, urlsFile = null, onProgress = null, concurrencyOverride = null } = {}) {
+    const hasConfig = fs.existsSync(configPath);
+    const config = hasConfig ? loadConfig(configPath) : {};
+    const configDefaults = config.defaults ?? {};
+    const tracked = trackedPages
+        ? trackedPages.map((entry) => entry?.startUrl ? buildTrackedPageEntry(entry) : buildTrackedPageEntry({
+            ...entry,
+            startUrl: entry?.url || entry?.startUrl,
+            outputBase: entry?.output_base || entry?.outputBase || entry?.outputFileBase
+        }))
+        : (urlsFile
+            ? loadTrackedPagesFromUrlsFile(urlsFile)
+            : (Array.isArray(config.trackedPages) ? config.trackedPages.map((entry) => buildTrackedPageEntry(entry)) : []));
+
+    if (tracked.length === 0) {
+        log('ERROR', 'No trackedPages found in config.');
+        return {
+            totalSources: 0,
+            processedSources: 0,
+            currentName: '',
+            currentUrl: '',
+            newUrlsFound: 0,
+            queuedFiles: 0,
+            errors: 1,
+            elapsedMs: 0,
+            sourceSummaries: []
+        };
+    }
+
+    const state = loadState();
+    if (!state.seen) state.seen = {};
+
+    const scrapedAt = formatScrapedAt();
+    const concurrency = concurrencyOverride ?? (urlsFile ? 1 : Math.max(1, Number(config.concurrency ?? 2)));
+
+    return runTrackedEntries({ tracked, configDefaults, state, scrapedAt, concurrency, onProgress });
+}
+
+async function runOnce({ configPath, urlsFile }) {
+    const summary = await runTrackedPagesOnce({ configPath, urlsFile });
+    if (summary.totalSources === 0) {
+        process.exitCode = 1;
+    }
 }
 
 function parseArgs(argv) {

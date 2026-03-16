@@ -16,7 +16,25 @@ import {
     testProxyProvider
 } from './scraper.js';
 import { runSitemapScraper, runBulkSitemapScraper, rescanSavedSitemaps } from './xml.js';
-import { getAllSitemaps, getHistoryCount, exportUrlsByStatus, getUrlsByStatus } from './db.js';
+import { runTrackedPagesOnce } from './rss.js';
+import {
+    getAllSitemaps,
+    getHistoryCount,
+    exportUrlsByStatus,
+    getUrlsByStatus,
+    getTrackedPages,
+    getEnabledTrackedPages,
+    getTrackedPageById,
+    saveTrackedPage,
+    setTrackedPageEnabled,
+    deleteTrackedPage,
+    updateTrackedPageRunResult,
+    getPageTrackerSchedule,
+    setPageTrackerSchedule,
+    setPageTrackerEnabled,
+    getPageTrackerLastSummary,
+    savePageTrackerLastSummary
+} from './db.js';
 
 // Utility function to escape MarkdownV2 special characters
 const escapeMarkdownV2 = (text) => {
@@ -44,6 +62,8 @@ const RETRY_OPTIONS = {
         label: 'Failed + No Result URLs'
     }
 };
+
+const PAGE_TRACKER_INTERVAL_OPTIONS = [1, 2, 6];
 
 const getResultDirPath = () => path.join(process.cwd(), 'result');
 
@@ -384,6 +404,9 @@ const buildHelpMessage = () => [
     formatHelpLine('🌐', '/sitemap_bulk', '- Scan all sitemap entries from sitemaps.txt'),
     formatHelpLine('🔄', '/sitemap_rescan [domain/all]', '- Rescan saved sitemap URLs'),
     '',
+    '📡 *Page Tracker*',
+    'Manage tracked homepage or feed URLs from the Telegram menu.',
+    '',
     '📊 *Results*',
     formatHelpLine('📡', '/status', '- Show current bot status'),
     formatHelpLine('📈', '/stats', '- Show scraping statistics'),
@@ -404,6 +427,7 @@ const buildHomeMenuKeyboard = () => ({
     inline_keyboard: [
         [{ text: '📰 Article', callback_data: 'home_section:article' }],
         [{ text: '🗺️ XML', callback_data: 'home_section:xml' }],
+        [{ text: '📡 Page Tracker', callback_data: 'home_section:page_tracker' }],
         [{ text: '📂 Results', callback_data: 'home_section:results' }],
         [{ text: '⚙️ System', callback_data: 'home_section:system' }]
     ]
@@ -436,6 +460,75 @@ const buildXmlMenuKeyboard = () => ({
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
 });
+
+const formatTrackedPageTypeLabel = (type) =>
+    String(type || 'html').toLowerCase() === 'rss' ? 'RSS / Atom Feed' : 'HTML Page';
+
+const formatTrackedPageShortLabel = (url, type) => {
+    try {
+        const parsed = new URL(url);
+        const host = parsed.hostname.replace(/^www\./, '');
+        const trimmedPath = parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/$/, '');
+        const shortPath = trimmedPath.length > 24 ? `${trimmedPath.slice(0, 21)}...` : trimmedPath;
+        const icon = String(type || 'html').toLowerCase() === 'rss' ? '📰' : '🌐';
+        return `${icon} ${host}${shortPath}`;
+    } catch {
+        return `🌐 ${url}`;
+    }
+};
+
+const buildPageTrackerMenuKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '➕ Add Tracked URL', callback_data: 'page_tracker_add' }],
+        [{ text: '📋 View Tracked URLs', callback_data: 'page_tracker_list' }],
+        [{ text: '▶️ Run Tracker Now', callback_data: 'page_tracker_run_all' }],
+        [{ text: '⏱ Tracker Schedule', callback_data: 'page_tracker_schedule' }],
+        [{ text: '📊 Last Tracker Summary', callback_data: 'page_tracker_last_summary' }],
+        [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
+    ]
+});
+
+const buildTrackedPagesKeyboard = () => {
+    const inlineKeyboard = getTrackedPages().map(page => ([
+        { text: formatTrackedPageShortLabel(page.url, page.type), callback_data: `page_tracker_view:${page.id}` }
+    ]));
+
+    inlineKeyboard.push([{ text: '⬅️ Back to Page Tracker', callback_data: 'home_section:page_tracker' }]);
+    return { inline_keyboard: inlineKeyboard };
+};
+
+const buildTrackedPageDetailKeyboard = (pageId, enabled) => ({
+    inline_keyboard: [
+        [{ text: '▶️ Run Now', callback_data: `page_tracker_run_one:${pageId}` }],
+        [{ text: enabled ? '⏸ Pause' : '▶️ Resume', callback_data: `page_tracker_toggle:${pageId}` }],
+        [{ text: '🗑 Delete', callback_data: `page_tracker_delete:${pageId}` }],
+        [{ text: '⬅️ Back to List', callback_data: 'page_tracker_list' }]
+    ]
+});
+
+const buildPageTrackerAddTypeKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '🌐 HTML Page', callback_data: 'page_tracker_add_type:html' }],
+        [{ text: '📰 RSS / Atom Feed', callback_data: 'page_tracker_add_type:rss' }],
+        [{ text: '⬅️ Back to Page Tracker', callback_data: 'home_section:page_tracker' }]
+    ]
+});
+
+const buildPageTrackerScheduleKeyboard = () => {
+    const schedule = getPageTrackerSchedule();
+    const inlineKeyboard = PAGE_TRACKER_INTERVAL_OPTIONS.map(hours => ([{
+        text: `${schedule.enabled && schedule.intervalHours === hours ? '✅' : '▫️'} Every ${hours} Hour${hours === 1 ? '' : 's'}`,
+        callback_data: `page_tracker_schedule_set:${hours}`
+    }]));
+
+    inlineKeyboard.push([{
+        text: schedule.enabled ? '⏸ Pause Scheduler' : '▶️ Resume Scheduler',
+        callback_data: schedule.enabled ? 'page_tracker_schedule_pause' : 'page_tracker_schedule_resume'
+    }]);
+    inlineKeyboard.push([{ text: '⬅️ Back to Page Tracker', callback_data: 'home_section:page_tracker' }]);
+
+    return { inline_keyboard: inlineKeyboard };
+};
 
 const buildResultsMenuKeyboard = () => ({
     inline_keyboard: [
@@ -507,6 +600,122 @@ const buildProxyMenuText = (statusLine = '') => {
     return lines.join('\n');
 };
 
+const buildPageTrackerMenuText = () => {
+    const schedule = getPageTrackerSchedule();
+    const trackedPages = getTrackedPages();
+
+    return [
+        'Page Tracker',
+        `Tracked URLs: ${trackedPages.length}`,
+        `Enabled: ${trackedPages.filter(page => Number(page.enabled) === 1).length}`,
+        `Schedule: ${schedule.enabled ? `Every ${schedule.intervalHours} hour${schedule.intervalHours === 1 ? '' : 's'}` : 'Paused'}`
+    ].join('\n');
+};
+
+const buildPageTrackerScheduleText = (statusLine = '') => {
+    const schedule = getPageTrackerSchedule();
+    const lines = [
+        'Tracker Schedule',
+        `Current: Every ${schedule.intervalHours} hour${schedule.intervalHours === 1 ? '' : 's'}`,
+        `Status: ${schedule.enabled ? 'Enabled' : 'Paused'}`
+    ];
+
+    if (statusLine) {
+        lines.push('', statusLine);
+    }
+
+    return lines.join('\n');
+};
+
+const buildTrackedPageDetailText = (page, statusLine = '') => {
+    const lines = [
+        'Tracked URL',
+        `URL: ${page.url}`,
+        `Type: ${formatTrackedPageTypeLabel(page.type)}`,
+        `Status: ${Number(page.enabled) === 1 ? 'Enabled' : 'Paused'}`,
+        `Last Run: ${page.last_run_at || 'Never'}`,
+        `Last Result: ${page.last_status ? `${page.last_status} • ${page.last_new_urls || 0} new URL(s)` : 'Never'}`
+    ];
+
+    if (statusLine) {
+        lines.push('', statusLine);
+    }
+
+    return lines.join('\n');
+};
+
+const buildPageTrackerProgressText = (summary) => {
+    const percent = summary.totalSources === 0 ? 0 : Math.round((summary.processedSources / summary.totalSources) * 100);
+
+    return [
+        '📡 Page Tracker Running',
+        `Sources: ${summary.processedSources}/${summary.totalSources}`,
+        `${buildProgressBar(summary.processedSources, summary.totalSources)} ${percent}%`,
+        '',
+        `Current: ${summary.currentUrl || '-'}`,
+        `🆕 New URLs: ${summary.newUrlsFound}`,
+        `📄 Queued Files: ${summary.queuedFiles}`,
+        `❌ Errors: ${summary.errors}`,
+        `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
+        `🕒 Updated: ${formatUpdatedTime()}`
+    ].join('\n');
+};
+
+const buildPageTrackerSummaryText = (summary) => {
+    return [
+        '✅ Page Tracker Complete',
+        `Sources Checked: ${summary.processedSources}/${summary.totalSources}`,
+        `New URLs Found: ${summary.newUrlsFound}`,
+        `Queued Files: ${summary.queuedFiles}`,
+        `Errors: ${summary.errors}`,
+        `Elapsed: ${formatElapsed(summary.elapsedMs)}`,
+        `Trigger: ${summary.trigger || 'manual'}`
+    ].join('\n');
+};
+
+const buildLastPageTrackerSummaryText = () => {
+    const summary = getPageTrackerLastSummary();
+    if (!summary) {
+        return 'No page tracker runs recorded yet.';
+    }
+
+    return [
+        'Last Tracker Summary',
+        `Ran At: ${summary.ranAt || 'Unknown'}`,
+        `Trigger: ${summary.trigger || 'manual'}`,
+        `Sources Checked: ${summary.processedSources}/${summary.totalSources}`,
+        `New URLs Found: ${summary.newUrlsFound}`,
+        `Queued Files: ${summary.queuedFiles}`,
+        `Errors: ${summary.errors}`,
+        `Elapsed: ${formatElapsed(summary.elapsedMs)}`
+    ].join('\n');
+};
+
+const showPageTrackerMenu = async (chatId, message = null) => {
+    await sendOrEditMenu(chatId, buildPageTrackerMenuText(), buildPageTrackerMenuKeyboard(), message);
+};
+
+const showTrackedPagesMenu = async (chatId, message = null) => {
+    const pages = getTrackedPages();
+    if (pages.length === 0) {
+        await sendOrEditMenu(chatId, 'No tracked URLs yet.', buildPageTrackerMenuKeyboard(), message);
+        return;
+    }
+
+    await sendOrEditMenu(chatId, 'Tracked URLs:', buildTrackedPagesKeyboard(), message);
+};
+
+const showTrackedPageDetail = async (chatId, pageId, message = null, statusLine = '') => {
+    const page = getTrackedPageById(pageId);
+    if (!page) {
+        await sendOrEditMenu(chatId, 'Tracked URL not found.', buildTrackedPagesKeyboard(), message);
+        return false;
+    }
+
+    await sendOrEditMenu(chatId, buildTrackedPageDetailText(page, statusLine), buildTrackedPageDetailKeyboard(page.id, Number(page.enabled) === 1), message);
+    return true;
+};
+
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env variables.');
     process.exit(1);
@@ -525,6 +734,9 @@ let currentTask = null;
 let auxiliaryTaskCounter = 0;
 const auxiliaryTasks = new Map();
 const AUXILIARY_TASK_RETENTION_MS = 5 * 60 * 1000;
+let pageTrackerTimer = null;
+let pageTrackerRunInProgress = false;
+const pendingTrackedPageAdds = new Map();
 
 const listRunningAuxTasks = () =>
     Array.from(auxiliaryTasks.values()).filter(task => task.status === 'running');
@@ -615,6 +827,16 @@ const getPendingChatInput = (chatId) => pendingChatInputs.get(chatId.toString())
 
 const clearPendingChatInput = (chatId) => {
     pendingChatInputs.delete(chatId.toString());
+};
+
+const setPendingTrackedPageAdd = (chatId, state) => {
+    pendingTrackedPageAdds.set(chatId.toString(), state);
+};
+
+const getPendingTrackedPageAdd = (chatId) => pendingTrackedPageAdds.get(chatId.toString()) || null;
+
+const clearPendingTrackedPageAdd = (chatId) => {
+    pendingTrackedPageAdds.delete(chatId.toString());
 };
 
 const ensureTelegramUploadDir = () => {
@@ -1105,6 +1327,135 @@ const buildSitemapRescanSummaryText = (summary) => {
     return lines.join('\n');
 };
 
+const startPageTrackerScheduler = () => {
+    if (pageTrackerTimer) {
+        clearInterval(pageTrackerTimer);
+        pageTrackerTimer = null;
+    }
+
+    const schedule = getPageTrackerSchedule();
+    if (!schedule.enabled) {
+        return;
+    }
+
+    pageTrackerTimer = setInterval(() => {
+        runPageTrackerFlow(null, 'scheduled').catch(error => {
+            console.error(`Scheduled page tracker failed: ${error.message}`);
+        });
+    }, schedule.intervalHours * 60 * 60 * 1000);
+
+    if (typeof pageTrackerTimer.unref === 'function') {
+        pageTrackerTimer.unref();
+    }
+};
+
+const persistPageTrackerSummary = (summary) => {
+    const ranAt = new Date().toISOString();
+
+    (summary.sourceSummaries || []).forEach(sourceSummary => {
+        if (!sourceSummary?.trackedPageId) {
+            return;
+        }
+
+        updateTrackedPageRunResult(sourceSummary.trackedPageId, {
+            lastRunAt: ranAt,
+            lastStatus: sourceSummary.status,
+            lastNewUrls: sourceSummary.newUrlsCount || 0
+        });
+    });
+
+    savePageTrackerLastSummary({
+        ...summary,
+        ranAt
+    });
+};
+
+const runPageTrackerFlow = async (chatId = null, trigger = 'manual', trackedPages = null) => {
+    if (pageTrackerRunInProgress) {
+        if (chatId) {
+            await sendPlainMessage('Page Tracker is already running.', chatId);
+        }
+        return null;
+    }
+
+    if (botStatus !== 'idle') {
+        if (chatId) {
+            await sendPlainMessage('A main scraping task is running. Try Page Tracker again when it finishes.', chatId);
+        }
+        return null;
+    }
+
+    const pagesToRun = Array.isArray(trackedPages) && trackedPages.length > 0
+        ? trackedPages
+        : getEnabledTrackedPages();
+
+    if (pagesToRun.length === 0) {
+        if (chatId) {
+            await sendPlainMessage('No enabled tracked URLs found.', chatId);
+        }
+        return null;
+    }
+
+    return runAuxTask('page_tracker', 'Page Tracker', async () => {
+        pageTrackerRunInProgress = true;
+        let trackerMessage = null;
+        let lastTrackerUpdateAt = 0;
+
+        const updateTracker = async (summary, force = false) => {
+            if (!chatId) {
+                return;
+            }
+
+            const now = Date.now();
+            if (!force && now - lastTrackerUpdateAt < LIVE_TRACKER_INTERVAL_MS) {
+                return;
+            }
+
+            lastTrackerUpdateAt = now;
+            const trackerText = buildPageTrackerProgressText(summary);
+
+            if (!trackerMessage) {
+                trackerMessage = await sendPlainMessage(trackerText, chatId);
+                return;
+            }
+
+            try {
+                await safeEditMessageText(chatId, trackerMessage.message_id, trackerText);
+            } catch (error) {
+                trackerMessage = await sendPlainMessage(trackerText, chatId);
+            }
+        };
+
+        try {
+            const summary = await runTrackedPagesOnce({
+                trackedPages: pagesToRun,
+                onProgress: async ({ stage, summary: progressSummary }) => {
+                    await updateTracker(progressSummary, stage === 'start' || stage === 'complete');
+                },
+                concurrencyOverride: 1
+            });
+
+            const completedSummary = {
+                ...summary,
+                trigger
+            };
+
+            persistPageTrackerSummary(completedSummary);
+            await updateTracker(completedSummary, true);
+
+            if (chatId) {
+                await sendPlainMessage(buildPageTrackerSummaryText(completedSummary), chatId);
+            } else if (completedSummary.newUrlsFound > 0 || completedSummary.errors > 0) {
+                await sendPlainMessage(buildPageTrackerSummaryText(completedSummary), TELEGRAM_CHAT_ID);
+            }
+
+            return completedSummary;
+        } finally {
+            pageTrackerRunInProgress = false;
+        }
+    });
+};
+
 const withBotStatus = async (status, task, action) => {
     setBotStatus(status, task);
     try {
@@ -1114,6 +1465,8 @@ const withBotStatus = async (status, task, action) => {
     }
 };
 
+startPageTrackerScheduler();
+
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
     const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
@@ -1122,6 +1475,7 @@ bot.onText(/\/start/, (msg) => {
         return;
     }
     clearPendingChatInput(msg.chat.id);
+    clearPendingTrackedPageAdd(msg.chat.id);
     showHomeMenu(msg.chat.id);
     // Set bot commands for better discoverability in Telegram UI
     bot.setMyCommands(BOT_COMMANDS).catch(error => {
@@ -1149,9 +1503,10 @@ bot.onText(/\/status/, (msg) => {
     const auxTaskSummary = status.auxTasks.length === 0
         ? 'None'
         : status.auxTasks.map((task, index) => `${index + 1}. ${task.label}`).join(' | ');
+    const trackerSchedule = getPageTrackerSchedule();
 
     sendMessage(
-        `*Bot Status:* ${escapeMarkdownV2(status.status)}\n*Current Task:* ${escapeMarkdownV2(status.task || 'None')}\n*Other Tasks:* ${escapeMarkdownV2(auxTaskSummary)}`
+        `*Bot Status:* ${escapeMarkdownV2(status.status)}\n*Current Task:* ${escapeMarkdownV2(status.task || 'None')}\n*Other Tasks:* ${escapeMarkdownV2(auxTaskSummary)}\n*Page Tracker:* ${escapeMarkdownV2(trackerSchedule.enabled ? `Every ${trackerSchedule.intervalHours} hour${trackerSchedule.intervalHours === 1 ? '' : 's'}` : 'Paused')}`
     );
 });
 
@@ -1282,6 +1637,30 @@ bot.on('message', async (msg) => {
         return;
     }
 
+    if (pendingInput.type === 'page_tracker_add_url') {
+        const inputUrl = String(msg.text || '').trim();
+        try {
+            new URL(inputUrl);
+        } catch (error) {
+            await sendPlainMessage('Please send a valid http or https URL.', msg.chat.id);
+            return;
+        }
+
+        clearPendingChatInput(msg.chat.id);
+        setPendingTrackedPageAdd(msg.chat.id, {
+            url: inputUrl,
+            menuMessageId: pendingInput.menuMessageId || null
+        });
+
+        await sendOrEditMenu(
+            msg.chat.id,
+            `Select tracker type for:\n${inputUrl}`,
+            buildPageTrackerAddTypeKeyboard(),
+            pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null
+        );
+        return;
+    }
+
     if (pendingInput.type === 'upload_txt') {
         await sendPlainMessage('Please send a .txt or .csv file.', msg.chat.id);
         return;
@@ -1340,6 +1719,7 @@ bot.on('callback_query', async (callbackQuery) => {
     clearPendingChatInput(msg.chat.id);
 
     if (data === 'home_back') {
+        clearPendingTrackedPageAdd(msg.chat.id);
         await safeAnswerCallbackQuery(callbackQuery.id);
         await showHomeMenu(msg.chat.id, msg);
         return;
@@ -1354,6 +1734,13 @@ bot.on('callback_query', async (callbackQuery) => {
     if (data === 'home_section:xml') {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await sendOrEditMenu(msg.chat.id, 'XML options:', buildXmlMenuKeyboard(), msg);
+        return;
+    }
+
+    if (data === 'home_section:page_tracker') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showPageTrackerMenu(msg.chat.id, msg);
         return;
     }
 
@@ -1372,6 +1759,60 @@ bot.on('callback_query', async (callbackQuery) => {
     if (data === 'home_open:scrape_file') {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await showScrapeFileSelectionMenu(msg.chat.id, msg);
+        return;
+    }
+
+    if (data === 'page_tracker_add') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        setPendingChatInput(msg.chat.id, {
+            type: 'page_tracker_add_url',
+            menuMessageId: msg.message_id
+        });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            'Add Tracked URL\n\nSend the page or feed URL in your next message.',
+            buildPageTrackerMenuKeyboard(),
+            msg
+        );
+        return;
+    }
+
+    if (data === 'page_tracker_list') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showTrackedPagesMenu(msg.chat.id, msg);
+        return;
+    }
+
+    if (data === 'page_tracker_run_all') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await runPageTrackerFlow(msg.chat.id, 'manual');
+        return;
+    }
+
+    if (data === 'page_tracker_schedule') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            buildPageTrackerScheduleText(),
+            buildPageTrackerScheduleKeyboard(),
+            msg
+        );
+        return;
+    }
+
+    if (data === 'page_tracker_last_summary') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            buildLastPageTrackerSummaryText(),
+            buildPageTrackerMenuKeyboard(),
+            msg
+        );
         return;
     }
 
@@ -1430,6 +1871,120 @@ bot.on('callback_query', async (callbackQuery) => {
                 'Send one or more sitemap URLs in your next message.',
                 'You can paste one URL per line or a space-separated list.'
             ],
+            msg
+        );
+        return;
+    }
+
+    if (data.startsWith('page_tracker_add_type:')) {
+        const pendingTrackedPageAdd = getPendingTrackedPageAdd(msg.chat.id);
+        if (!pendingTrackedPageAdd?.url) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Send the tracked URL again first.', show_alert: true });
+            await showPageTrackerMenu(msg.chat.id, msg);
+            return;
+        }
+
+        const selectedType = path.basename(data.slice('page_tracker_add_type:'.length)).toLowerCase() === 'rss' ? 'rss' : 'html';
+        clearPendingTrackedPageAdd(msg.chat.id);
+        const savedPage = saveTrackedPage(pendingTrackedPageAdd.url, selectedType);
+
+        await safeAnswerCallbackQuery(callbackQuery.id, {
+            text: `Tracked URL added as ${formatTrackedPageTypeLabel(selectedType)}`
+        });
+        await showTrackedPageDetail(msg.chat.id, savedPage.id, msg, '✅ Tracked URL added');
+        return;
+    }
+
+    if (data.startsWith('page_tracker_view:')) {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        const pageId = Number(data.slice('page_tracker_view:'.length));
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showTrackedPageDetail(msg.chat.id, pageId, msg);
+        return;
+    }
+
+    if (data.startsWith('page_tracker_run_one:')) {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        const pageId = Number(data.slice('page_tracker_run_one:'.length));
+        const trackedPage = getTrackedPageById(pageId);
+
+        if (!trackedPage) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Tracked URL not found', show_alert: true });
+            return;
+        }
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await runPageTrackerFlow(msg.chat.id, 'manual', [trackedPage]);
+        return;
+    }
+
+    if (data.startsWith('page_tracker_toggle:')) {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        const pageId = Number(data.slice('page_tracker_toggle:'.length));
+        const trackedPage = getTrackedPageById(pageId);
+
+        if (!trackedPage) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Tracked URL not found', show_alert: true });
+            return;
+        }
+
+        const updatedPage = setTrackedPageEnabled(pageId, Number(trackedPage.enabled) !== 1);
+        await safeAnswerCallbackQuery(callbackQuery.id, {
+            text: Number(updatedPage.enabled) === 1 ? 'Tracker resumed' : 'Tracker paused'
+        });
+        await showTrackedPageDetail(msg.chat.id, pageId, msg, Number(updatedPage.enabled) === 1 ? '✅ Tracker resumed' : '⏸ Tracker paused');
+        return;
+    }
+
+    if (data.startsWith('page_tracker_delete:')) {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        const pageId = Number(data.slice('page_tracker_delete:'.length));
+        deleteTrackedPage(pageId);
+        await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Tracked URL deleted' });
+        await showTrackedPagesMenu(msg.chat.id, msg);
+        return;
+    }
+
+    if (data.startsWith('page_tracker_schedule_set:')) {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        const intervalHours = Number(data.slice('page_tracker_schedule_set:'.length)) || 1;
+        const schedule = setPageTrackerSchedule(intervalHours, true);
+        startPageTrackerScheduler();
+        await safeAnswerCallbackQuery(callbackQuery.id, {
+            text: `Schedule set to every ${schedule.intervalHours} hour${schedule.intervalHours === 1 ? '' : 's'}`
+        });
+        await sendOrEditMenu(
+            msg.chat.id,
+            buildPageTrackerScheduleText(`✅ Schedule updated to every ${schedule.intervalHours} hour${schedule.intervalHours === 1 ? '' : 's'}`),
+            buildPageTrackerScheduleKeyboard(),
+            msg
+        );
+        return;
+    }
+
+    if (data === 'page_tracker_schedule_pause') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        setPageTrackerEnabled(false);
+        startPageTrackerScheduler();
+        await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Scheduler paused' });
+        await sendOrEditMenu(
+            msg.chat.id,
+            buildPageTrackerScheduleText('⏸ Scheduler paused'),
+            buildPageTrackerScheduleKeyboard(),
+            msg
+        );
+        return;
+    }
+
+    if (data === 'page_tracker_schedule_resume') {
+        clearPendingTrackedPageAdd(msg.chat.id);
+        const schedule = setPageTrackerEnabled(true);
+        startPageTrackerScheduler();
+        await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Scheduler resumed' });
+        await sendOrEditMenu(
+            msg.chat.id,
+            buildPageTrackerScheduleText(`✅ Scheduler resumed. Every ${schedule.intervalHours} hour${schedule.intervalHours === 1 ? '' : 's'}`),
+            buildPageTrackerScheduleKeyboard(),
             msg
         );
         return;
@@ -1549,6 +2104,7 @@ bot.on('callback_query', async (callbackQuery) => {
         const auxTaskSummary = status.auxTasks.length === 0
             ? 'None'
             : status.auxTasks.map((task, index) => `${index + 1}. ${task.label}`).join(' | ');
+        const trackerSchedule = getPageTrackerSchedule();
         await safeAnswerCallbackQuery(callbackQuery.id);
         await showHomeInfoPage(
             msg.chat.id,
@@ -1557,6 +2113,7 @@ bot.on('callback_query', async (callbackQuery) => {
                 `Status: ${status.status}`,
                 `Current Task: ${status.task || 'None'}`,
                 `Other Tasks: ${auxTaskSummary}`,
+                `Page Tracker: ${trackerSchedule.enabled ? `Every ${trackerSchedule.intervalHours} hour${trackerSchedule.intervalHours === 1 ? '' : 's'}` : 'Paused'}`,
                 `Proxy Mode: ${formatProxyModeLabel(getProxyMode())}`
             ],
             msg
