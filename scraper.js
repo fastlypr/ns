@@ -9,12 +9,15 @@ import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrl
 
 // Configuration
 const TIMEOUT = 15000; // 15 seconds
-let CONCURRENCY_LIMIT = 20; // High concurrency for speed
+const DEFAULT_CONCURRENCY_LIMIT = 20;
+let CONCURRENCY_LIMIT = DEFAULT_CONCURRENCY_LIMIT; // High concurrency for speed
 let PROXY_LIST = [];
 let CRAWLBASE_TOKEN = '';
 let PROXY_MODE = 'AUTO';
 let scraperInitialized = false;
 const PROXY_MODE_FILE = path.join(process.cwd(), 'proxy_mode.txt');
+const PROXY_LIST_FILE = path.join(process.cwd(), 'proxies.txt');
+const CRAWLBASE_TOKEN_FILE = path.join(process.cwd(), 'crawlbase_token.txt');
 
 function normalizeProxyMode(mode) {
     const normalized = String(mode || '').trim().toUpperCase();
@@ -48,16 +51,18 @@ function saveProxyMode(mode) {
  * Loads proxies from proxies.txt and Crawlbase token
  */
 function loadProxies() {
+    PROXY_LIST = [];
+    CRAWLBASE_TOKEN = '';
+    CONCURRENCY_LIMIT = DEFAULT_CONCURRENCY_LIMIT;
+
     // Load Crawlbase Token
-    const tokenPath = path.join(process.cwd(), 'crawlbase_token.txt');
-    if (fs.existsSync(tokenPath)) {
-        CRAWLBASE_TOKEN = fs.readFileSync(tokenPath, 'utf8').trim();
+    if (fs.existsSync(CRAWLBASE_TOKEN_FILE)) {
+        CRAWLBASE_TOKEN = fs.readFileSync(CRAWLBASE_TOKEN_FILE, 'utf8').trim();
         if (CRAWLBASE_TOKEN) console.log(`\n🔑 Crawlbase Token Loaded`);
     }
 
-    const proxyPath = path.join(process.cwd(), 'proxies.txt');
-    if (fs.existsSync(proxyPath)) {
-        const content = fs.readFileSync(proxyPath, 'utf8');
+    if (fs.existsSync(PROXY_LIST_FILE)) {
+        const content = fs.readFileSync(PROXY_LIST_FILE, 'utf8');
         PROXY_LIST = content.split('\n')
             .map(line => line.trim())
             .filter(line => line && !line.startsWith('#'))
@@ -106,6 +111,118 @@ export function setProxyMode(mode) {
         initializeScraper({ proxyMode: PROXY_MODE });
     }
     return PROXY_MODE;
+}
+
+function normalizeProxyText(rawText = '') {
+    const normalized = String(rawText || '').trim();
+    if (normalized.toUpperCase() === 'CLEAR') {
+        return '';
+    }
+
+    return normalized
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line && !line.startsWith('#'))
+        .join('\n');
+}
+
+function reloadProxySettings() {
+    loadProxies();
+    scraperInitialized = true;
+}
+
+export function getProxyConfigSummary() {
+    ensureScraperInitialized();
+    return {
+        mode: PROXY_MODE,
+        webshareCount: PROXY_LIST.length,
+        crawlbaseConfigured: Boolean(CRAWLBASE_TOKEN)
+    };
+}
+
+export function updateWebshareProxyList(rawText) {
+    const normalized = normalizeProxyText(rawText);
+
+    if (normalized) {
+        fs.writeFileSync(PROXY_LIST_FILE, `${normalized}\n`);
+    } else if (fs.existsSync(PROXY_LIST_FILE)) {
+        fs.unlinkSync(PROXY_LIST_FILE);
+    }
+
+    reloadProxySettings();
+    return getProxyConfigSummary();
+}
+
+export function updateCrawlbaseToken(rawToken) {
+    const normalized = String(rawToken || '').trim();
+    const shouldClear = normalized.toUpperCase() === 'CLEAR' || normalized.length === 0;
+
+    if (!shouldClear) {
+        fs.writeFileSync(CRAWLBASE_TOKEN_FILE, `${normalized}\n`);
+    } else if (fs.existsSync(CRAWLBASE_TOKEN_FILE)) {
+        fs.unlinkSync(CRAWLBASE_TOKEN_FILE);
+    }
+
+    reloadProxySettings();
+    return getProxyConfigSummary();
+}
+
+export async function testProxyProvider(provider) {
+    ensureScraperInitialized();
+
+    const normalizedProvider = String(provider || '').trim().toUpperCase();
+    let agent;
+    let providerLabel = '';
+
+    if (normalizedProvider === 'WEBSHARE') {
+        if (PROXY_LIST.length === 0) {
+            return { success: false, provider: 'Webshare', message: 'No Webshare proxies configured' };
+        }
+
+        agent = getRandomProxyAgent();
+        providerLabel = 'Webshare';
+    } else if (normalizedProvider === 'CRAWLBASE') {
+        if (!CRAWLBASE_TOKEN) {
+            return { success: false, provider: 'Crawlbase', message: 'No Crawlbase token configured' };
+        }
+
+        const proxyUrl = `http://${CRAWLBASE_TOKEN}@smartproxy.crawlbase.com:8012`;
+        agent = {
+            http: new HttpProxyAgent({ proxy: proxyUrl }),
+            https: new HttpsProxyAgent({ proxy: proxyUrl })
+        };
+        providerLabel = 'Crawlbase';
+    } else {
+        return { success: false, provider: normalizedProvider, message: 'Unsupported proxy provider' };
+    }
+
+    try {
+        const response = await gotScraping('https://api.ipify.org?format=json', {
+            agent,
+            timeout: { request: 10000 },
+            retry: { limit: 0 }
+        });
+
+        let ip = '';
+        try {
+            ip = JSON.parse(response.body || '{}').ip || '';
+        } catch (error) {
+            ip = '';
+        }
+
+        return {
+            success: true,
+            provider: providerLabel,
+            ip,
+            message: ip ? `Connected via ${ip}` : 'Connection successful'
+        };
+    } catch (error) {
+        return {
+            success: false,
+            provider: providerLabel,
+            message: error.message
+        };
+    }
 }
 
 function ensureScraperInitialized() {

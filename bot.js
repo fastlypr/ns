@@ -9,7 +9,11 @@ import {
     processToScrapeFolder,
     initializeScraper,
     getProxyMode,
-    setProxyMode
+    setProxyMode,
+    getProxyConfigSummary,
+    updateWebshareProxyList,
+    updateCrawlbaseToken,
+    testProxyProvider
 } from './scraper.js';
 import { runSitemapScraper, runBulkSitemapScraper, rescanSavedSitemaps } from './xml.js';
 import { getAllSitemaps, getHistoryCount, exportUrlsByStatus, getUrlsByStatus } from './db.js';
@@ -478,9 +482,29 @@ const buildProxyModeKeyboard = () => {
             [formatOption('DIRECT_ONLY', 'Direct Only')],
             [formatOption('WEBSHARE_ONLY', 'Webshare Only')],
             [formatOption('CRAWLBASE_ONLY', 'Crawlbase Only')],
+            [{ text: '📝 Update Webshare', callback_data: 'proxy_input:webshare' }],
+            [{ text: '🔑 Update Crawlbase', callback_data: 'proxy_input:crawlbase' }],
+            [{ text: '🧪 Test Webshare', callback_data: 'proxy_test:webshare' }],
+            [{ text: '🧪 Test Crawlbase', callback_data: 'proxy_test:crawlbase' }],
             [{ text: '⬅️ Back to System', callback_data: 'home_section:system' }]
         ]
     };
+};
+
+const buildProxyMenuText = (statusLine = '') => {
+    const summary = getProxyConfigSummary();
+    const lines = [
+        'Choose proxy mode:',
+        `Current: ${formatProxyModeLabel(summary.mode)}`,
+        `Webshare Proxies: ${summary.webshareCount}`,
+        `Crawlbase Token: ${summary.crawlbaseConfigured ? 'Set' : 'Not Set'}`
+    ];
+
+    if (statusLine) {
+        lines.push('', statusLine);
+    }
+
+    return lines.join('\n');
 };
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -1137,6 +1161,48 @@ bot.on('message', async (msg) => {
         return;
     }
 
+    if (pendingInput.type === 'proxy_update_webshare') {
+        clearPendingChatInput(msg.chat.id);
+        try {
+            const summary = updateWebshareProxyList(msg.text);
+            await sendOrEditMenu(
+                msg.chat.id,
+                buildProxyMenuText(`✅ Webshare proxies updated. Loaded: ${summary.webshareCount}`),
+                buildProxyModeKeyboard(),
+                pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null
+            );
+        } catch (error) {
+            await sendOrEditMenu(
+                msg.chat.id,
+                buildProxyMenuText(`❌ Failed to update Webshare proxies: ${error.message}`),
+                buildProxyModeKeyboard(),
+                pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null
+            );
+        }
+        return;
+    }
+
+    if (pendingInput.type === 'proxy_update_crawlbase') {
+        clearPendingChatInput(msg.chat.id);
+        try {
+            const summary = updateCrawlbaseToken(msg.text);
+            await sendOrEditMenu(
+                msg.chat.id,
+                buildProxyMenuText(`✅ Crawlbase token updated. Status: ${summary.crawlbaseConfigured ? 'Set' : 'Not Set'}`),
+                buildProxyModeKeyboard(),
+                pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null
+            );
+        } catch (error) {
+            await sendOrEditMenu(
+                msg.chat.id,
+                buildProxyMenuText(`❌ Failed to update Crawlbase token: ${error.message}`),
+                buildProxyModeKeyboard(),
+                pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null
+            );
+        }
+        return;
+    }
+
     if (pendingInput.type === 'upload_txt') {
         await sendPlainMessage('Please send a .txt or .csv file.', msg.chat.id);
         return;
@@ -1319,7 +1385,7 @@ bot.on('callback_query', async (callbackQuery) => {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await sendOrEditMenu(
             msg.chat.id,
-            `Choose proxy mode:\nCurrent: ${formatProxyModeLabel(getProxyMode())}`,
+            buildProxyMenuText(),
             buildProxyModeKeyboard(),
             msg
         );
@@ -1334,10 +1400,68 @@ bot.on('callback_query', async (callbackQuery) => {
         });
         await sendOrEditMenu(
             msg.chat.id,
-            `Choose proxy mode:\nCurrent: ${formatProxyModeLabel(currentMode)}`,
+            buildProxyMenuText(`✅ Proxy mode set to ${formatProxyModeLabel(currentMode)}`),
             buildProxyModeKeyboard(),
             msg
         );
+        return;
+    }
+
+    if (data === 'proxy_input:webshare') {
+        setPendingChatInput(msg.chat.id, {
+            type: 'proxy_update_webshare',
+            menuMessageId: msg.message_id
+        });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            `${buildProxyMenuText()}\n\nPaste Webshare proxies in your next message.\nOne proxy per line.\nSend CLEAR to remove all Webshare proxies.`,
+            buildProxyModeKeyboard(),
+            msg
+        );
+        return;
+    }
+
+    if (data === 'proxy_input:crawlbase') {
+        setPendingChatInput(msg.chat.id, {
+            type: 'proxy_update_crawlbase',
+            menuMessageId: msg.message_id
+        });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            `${buildProxyMenuText()}\n\nPaste the Crawlbase token in your next message.\nSend CLEAR to remove the saved token.`,
+            buildProxyModeKeyboard(),
+            msg
+        );
+        return;
+    }
+
+    if (data.startsWith('proxy_test:')) {
+        const provider = path.basename(data.split(':')[1] || '').toUpperCase();
+        const providerLabel = provider === 'CRAWLBASE' ? 'Crawlbase' : 'Webshare';
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await runAuxTask('proxy_test', `Test ${providerLabel} proxy`, async () => {
+            await sendOrEditMenu(
+                msg.chat.id,
+                buildProxyMenuText(`🧪 Testing ${providerLabel}...`),
+                buildProxyModeKeyboard(),
+                msg
+            );
+
+            const result = await testProxyProvider(provider);
+            const statusLine = result.success
+                ? `✅ ${providerLabel} test passed${result.ip ? ` • IP: ${result.ip}` : ''}`
+                : `❌ ${providerLabel} test failed: ${result.message}`;
+
+            await sendOrEditMenu(
+                msg.chat.id,
+                buildProxyMenuText(statusLine),
+                buildProxyModeKeyboard(),
+                msg
+            );
+        });
         return;
     }
 
