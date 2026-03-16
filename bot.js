@@ -881,6 +881,85 @@ const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
     await sendPlainMessage(buildFileScrapeSummaryText(label, summary), chatId);
 };
 
+const buildRetryProgressText = (targetLabel, typeLabel, summary) => {
+    const percent = summary.totalUrls === 0 ? 0 : Math.round((summary.processedUrls / summary.totalUrls) * 100);
+
+    return [
+        '♻️ Retry Running',
+        `Target: ${targetLabel}`,
+        `Type: ${typeLabel}`,
+        '',
+        `URLs: ${summary.processedUrls}/${summary.totalUrls}`,
+        `${buildProgressBar(summary.processedUrls, summary.totalUrls)} ${percent}%`,
+        '',
+        `✅ Success: ${summary.successCount}`,
+        `❌ Failed: ${summary.failedCount}`,
+        `⚠️ No Result: ${summary.noResultCount}`,
+        `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
+        '',
+        `🔗 Current: ${summary.currentUrl || '-'}`,
+        `🕒 Updated: ${formatUpdatedTime()}`
+    ].join('\n');
+};
+
+const buildRetrySummaryText = (targetLabel, typeLabel, summary) => {
+    return [
+        '✅ Retry Complete',
+        `Target: ${targetLabel}`,
+        `Type: ${typeLabel}`,
+        `Processed: ${summary.processedUrls}/${summary.totalUrls}`,
+        `Success: ${summary.successCount}`,
+        `Failed: ${summary.failedCount}`,
+        `No Result: ${summary.noResultCount}`,
+        `Elapsed: ${formatElapsed(summary.elapsedMs)}`
+    ].join('\n');
+};
+
+const runTrackedRetryScrape = async (chatId, targetLabel, typeLabel, urls) => {
+    const initialSummary = {
+        totalUrls: urls.length,
+        processedUrls: 0,
+        successCount: 0,
+        failedCount: 0,
+        noResultCount: 0,
+        currentUrl: '',
+        elapsedMs: 0
+    };
+
+    let trackerMessage = await sendPlainMessage(buildRetryProgressText(targetLabel, typeLabel, initialSummary), chatId);
+    let lastTrackerUpdateAt = 0;
+
+    const updateTracker = async (summary, force = false) => {
+        const now = Date.now();
+        if (!force && now - lastTrackerUpdateAt < LIVE_TRACKER_INTERVAL_MS) {
+            return;
+        }
+
+        lastTrackerUpdateAt = now;
+        const trackerText = buildRetryProgressText(targetLabel, typeLabel, summary);
+
+        try {
+            await safeEditMessageText(chatId, trackerMessage.message_id, trackerText);
+        } catch (error) {
+            trackerMessage = await sendPlainMessage(trackerText, chatId);
+        }
+    };
+
+    const summary = await runScraper(urls, null, true, {
+        onProgress: async (progress) => {
+            await updateTracker(progress, progress.stage === 'start' || progress.stage === 'complete');
+        }
+    });
+
+    if (!summary) {
+        await sendPlainMessage(`No URLs found for ${typeLabel} on ${targetLabel}.`, chatId);
+        return;
+    }
+
+    await updateTracker(summary, true);
+    await sendPlainMessage(buildRetrySummaryText(targetLabel, typeLabel, summary), chatId);
+};
+
 const buildSitemapScanProgressText = (summary) => {
     const percent = summary.totalRootSitemaps === 0
         ? 0
@@ -1593,12 +1672,10 @@ bot.on('callback_query', async (callbackQuery) => {
             return;
         }
 
-        const retryLabel = domain === 'all'
-            ? `${retryOption.label} • All Domains`
-            : `${retryOption.label} • ${domain}`;
+        const retryTargetLabel = domain === 'all' ? 'All Domains' : domain;
 
         await withBotStatus('retry', `retry:${retryKey}:${domain}`, async () => {
-            await runTrackedUrlListScrape(msg.chat.id, retryLabel, urlsToRetry, true);
+            await runTrackedRetryScrape(msg.chat.id, retryTargetLabel, retryOption.label, urlsToRetry);
         });
         return;
     }
