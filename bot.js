@@ -1445,12 +1445,21 @@ const shortenText = (text, maxLength = 60) => {
 const buildFileScrapeProgressText = (fileName, summary) => {
     const percent = summary.totalUrls === 0 ? 0 : Math.round((summary.processedUrls / summary.totalUrls) * 100);
     return [
-        `📄 ${fileName}`,
-        `${buildProgressBar(summary.processedUrls, summary.totalUrls)} ${percent}%  •  ${summary.processedUrls}/${summary.totalUrls}`,
-        `⏱ ${formatElapsed(summary.elapsedMs)}  •  ✅ ${summary.successCount}  •  ❌ ${summary.failedCount}  •  ⚠️ ${summary.noResultCount}`,
+        '📄 File Scrape Running',
+        `File: ${fileName}`,
+        '',
+        `URLs: ${summary.processedUrls}/${summary.totalUrls}`,
+        `${buildProgressBar(summary.processedUrls, summary.totalUrls)} ${percent}%`,
+        '',
+        `✅ Success: ${summary.successCount}`,
+        `❌ Failed: ${summary.failedCount}`,
+        `⚠️ No Result: ${summary.noResultCount}`,
         `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
         `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
-        `🔗 ${shortenText(summary.currentUrl)}`
+        `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
+        '',
+        `🔗 Current: ${summary.currentUrl || '-'}`,
+        `🕒 Updated: ${formatUpdatedTime()}`
     ].join('\n');
 };
 
@@ -1514,12 +1523,24 @@ const buildFolderScrapeSummaryText = (summary) => {
 
 const runTrackedFileScrape = async (chatId, filePath) => {
     const fileName = path.basename(filePath);
-    let trackerMessage = await sendPlainMessage(`📄 ${fileName}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n👔 LinkedIn Leads: 0\n📸 Instagram Leads: 0\n🔗 -`, chatId);
+    const initialSummary = {
+        totalUrls: 0,
+        processedUrls: 0,
+        successCount: 0,
+        failedCount: 0,
+        noResultCount: 0,
+        linkedinLeadCount: 0,
+        instagramLeadCount: 0,
+        currentUrl: '',
+        elapsedMs: 0
+    };
+
+    let trackerMessage = await sendPlainMessage(buildFileScrapeProgressText(fileName, initialSummary), chatId);
     let lastTrackerUpdateAt = 0;
 
     const updateTracker = async (summary, force = false) => {
         const now = Date.now();
-        if (!force && now - lastTrackerUpdateAt < 1500) {
+        if (!force && now - lastTrackerUpdateAt < LIVE_TRACKER_INTERVAL_MS) {
             return;
         }
 
@@ -1598,12 +1619,24 @@ const runTrackedFolderScrape = async (chatId, toScrapeDir) => {
 };
 
 const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
-    let trackerMessage = await sendPlainMessage(`📄 ${label}\n${buildProgressBar(0, 1)} 0%  •  0/0\n⏱ 00:00  •  ✅ 0  •  ❌ 0  •  ⚠️ 0\n👔 LinkedIn Leads: 0\n📸 Instagram Leads: 0\n🔗 -`, chatId);
+    const initialSummary = {
+        totalUrls: urls.length,
+        processedUrls: 0,
+        successCount: 0,
+        failedCount: 0,
+        noResultCount: 0,
+        linkedinLeadCount: 0,
+        instagramLeadCount: 0,
+        currentUrl: '',
+        elapsedMs: 0
+    };
+
+    let trackerMessage = await sendPlainMessage(buildFileScrapeProgressText(label, initialSummary), chatId);
     let lastTrackerUpdateAt = 0;
 
     const updateTracker = async (summary, force = false) => {
         const now = Date.now();
-        if (!force && now - lastTrackerUpdateAt < 1500) {
+        if (!force && now - lastTrackerUpdateAt < LIVE_TRACKER_INTERVAL_MS) {
             return;
         }
 
