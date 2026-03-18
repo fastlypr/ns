@@ -29,3 +29,5 @@ if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
 
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim() || '8799281310:AAFDXQUC79RheOETZttqOgOXYB8CaLKM79U';
 export const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID?.trim() || '1032664219';
+export const DOWNLOAD_LINK_BASE_URL = process.env.DOWNLOAD_LINK_BASE_URL?.trim() || '';
+export const DOWNLOAD_LINK_PORT = Number(process.env.DOWNLOAD_LINK_PORT || '8787');
