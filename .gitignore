@@ -9,3 +9,5 @@ input.txt
 export_*.txt
 *.tmp
 history.db
+.page_tracker_state.json
+rss/*.csv
