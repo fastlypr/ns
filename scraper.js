@@ -5,7 +5,7 @@ import readlineSync from 'readline-sync';
 import fs from 'fs';
 import path from 'path';
 import { runSitemapScraper, rescanSavedSitemaps, runBulkSitemapScraper, runSitemapScraperCLI } from './xml.js';
-import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus } from './db.js';
+import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus, getDomainVariable } from './db.js';
 
 // Configuration
 const TIMEOUT = 15000; // 15 seconds
@@ -570,15 +570,81 @@ function saveResults(result) {
     const day = now.getDate();
     const timestamp = `${month} ${day}`;
 
+    const parseCsvLine = (line) => {
+        const values = [];
+        let current = '';
+        let inQuotes = false;
+
+        for (let i = 0; i < line.length; i++) {
+            const char = line[i];
+
+            if (char === '"') {
+                if (inQuotes && line[i + 1] === '"') {
+                    current += '"';
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+                continue;
+            }
+
+            if (char === ',' && !inQuotes) {
+                values.push(current);
+                current = '';
+                continue;
+            }
+
+            current += char;
+        }
+
+        values.push(current);
+        return values;
+    };
+
+    const escapeCsvCell = (value) => {
+        const stringValue = value === null || value === undefined ? '' : String(value);
+        if (/[",\n]/.test(stringValue)) {
+            return `"${stringValue.replace(/"/g, '""')}"`;
+        }
+        return stringValue;
+    };
+
+    const serializeCsvLine = (values) => values.map(escapeCsvCell).join(',');
+
+    const ensureCsvColumn = (filePath, columnName) => {
+        if (!fs.existsSync(filePath)) return;
+
+        const content = fs.readFileSync(filePath, 'utf8');
+        if (!content.trim()) return;
+
+        const lines = content.split('\n');
+        const header = parseCsvLine(lines[0]);
+        if (header.includes(columnName)) return;
+
+        header.push(columnName);
+        const updatedLines = lines.map((line, index) => {
+            if (!line.trim()) return line;
+            if (index === 0) return serializeCsvLine(header);
+            const values = parseCsvLine(line);
+            values.push('');
+            return serializeCsvLine(values);
+        });
+
+        fs.writeFileSync(filePath, updatedLines.join('\n'));
+    };
+
     // Consolidated CSV Path
     const allResultsPath = path.join(resultDir, 'all_results.csv');
     if (!fs.existsSync(allResultsPath)) {
-        fs.writeFileSync(allResultsPath, 'Timestamp,Domain,Platform,Source URL,Social Link,Username,Category\n');
+        fs.writeFileSync(allResultsPath, 'Timestamp,Domain,Platform,Source URL,Social Link,Username,Category,Domain Variable\n');
+    } else {
+        ensureCsvColumn(allResultsPath, 'Domain Variable');
     }
 
     try {
         const urlObj = new URL(result.source_url);
         let domain = urlObj.hostname.replace(/^www\./, '');
+        const domainVariable = getDomainVariable(domain);
         
         const domainDir = path.join(resultDir, domain);
         if (!fs.existsSync(domainDir)) fs.mkdirSync(domainDir);
@@ -593,9 +659,10 @@ function saveResults(result) {
             let existingLinks = new Set();
             
             if (fs.existsSync(filePath)) {
+                ensureCsvColumn(filePath, 'Domain Variable');
                 const content = fs.readFileSync(filePath, 'utf8');
                 content.split('\n').forEach(line => {
-                    const parts = line.split(',');
+                    const parts = parseCsvLine(line);
                     // Format changed to include Timestamp at the end or beginning?
                     // User said: "save results with timestamp in csv file"
                     // Existing header: Source URL,Social Link,Username,Category
@@ -624,7 +691,7 @@ function saveResults(result) {
                     }
                 });
             } else {
-                fs.writeFileSync(filePath, 'Source URL,Social Link,Username,Category,Timestamp\n');
+                fs.writeFileSync(filePath, 'Source URL,Social Link,Username,Category,Timestamp,Domain Variable\n');
             }
             
             let shouldSave = false;
@@ -650,12 +717,12 @@ function saveResults(result) {
                 const category = social.category || 'link';
                 
                 // 1. Save to Domain Specific File
-                fs.appendFileSync(filePath, `${cleanSource},${cleanLink},${cleanUser},${category},${timestamp}\n`);
+                fs.appendFileSync(filePath, `${cleanSource},${cleanLink},${cleanUser},${category},${timestamp},${escapeCsvCell(domainVariable)}\n`);
                 console.log(`   💾 Saved to result/${domain}/${fileName}`);
 
                 // 2. Save to Consolidated File (Append Only)
-                // Header: Timestamp,Domain,Platform,Source URL,Social Link,Username,Category
-                const csvLine = `${timestamp},${domain},${platform},${cleanSource},${cleanLink},${cleanUser},${category}\n`;
+                // Header: Timestamp,Domain,Platform,Source URL,Social Link,Username,Category,Domain Variable
+                const csvLine = `${timestamp},${domain},${platform},${cleanSource},${cleanLink},${cleanUser},${category},${escapeCsvCell(domainVariable)}\n`;
                 fs.appendFileSync(allResultsPath, csvLine);
             }
         });

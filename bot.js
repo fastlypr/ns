@@ -1,5 +1,8 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } from './config.js';
+import { createServer } from 'http';
+import os from 'os';
+import { randomBytes } from 'crypto';
+import { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DOWNLOAD_LINK_BASE_URL, DOWNLOAD_LINK_PORT } from './config.js';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
@@ -36,7 +39,9 @@ import {
     setPageTrackerSchedule,
     setPageTrackerEnabled,
     getPageTrackerLastSummary,
-    savePageTrackerLastSummary
+    savePageTrackerLastSummary,
+    getDomainVariable,
+    setDomainVariable
 } from './db.js';
 
 // Utility function to escape MarkdownV2 special characters
@@ -70,12 +75,128 @@ const PAGE_TRACKER_INTERVAL_OPTIONS = [1, 2, 6];
 const execFileAsync = promisify(execFile);
 const DEPLOY_STATUS_FILE = path.join(process.cwd(), '.deploy_status.json');
 const DEPLOY_SCRIPT_PATH = path.join(process.cwd(), 'deploy_bot.sh');
+const DOWNLOAD_LINK_TTL_MS = 30 * 60 * 1000;
+const downloadLinkTokens = new Map();
+let downloadServerStarted = false;
 
 const getResultDirPath = () => path.join(process.cwd(), 'result');
 
 const getAllResultsPath = () => path.join(getResultDirPath(), 'all_results.csv');
 
 const getHistoryDbPath = () => path.join(process.cwd(), 'history.db');
+
+const getFallbackDownloadHost = () => {
+    const interfaces = os.networkInterfaces();
+
+    for (const entries of Object.values(interfaces)) {
+        for (const entry of entries || []) {
+            if (entry && entry.family === 'IPv4' && !entry.internal) {
+                return entry.address;
+            }
+        }
+    }
+
+    return 'localhost';
+};
+
+const getDownloadBaseUrl = () => {
+    if (DOWNLOAD_LINK_BASE_URL) {
+        return DOWNLOAD_LINK_BASE_URL.replace(/\/+$/, '');
+    }
+
+    return `http://${getFallbackDownloadHost()}:${DOWNLOAD_LINK_PORT}`;
+};
+
+const cleanupExpiredDownloadLinks = () => {
+    const now = Date.now();
+    for (const [token, entry] of downloadLinkTokens.entries()) {
+        if (!entry || entry.expiresAt <= now) {
+            downloadLinkTokens.delete(token);
+        }
+    }
+};
+
+const createHistoryDbDownloadLink = () => {
+    cleanupExpiredDownloadLinks();
+    const token = randomBytes(24).toString('hex');
+    downloadLinkTokens.set(token, {
+        type: 'history_db',
+        expiresAt: Date.now() + DOWNLOAD_LINK_TTL_MS
+    });
+
+    return {
+        url: `${getDownloadBaseUrl()}/download/history-db/${token}`,
+        configuredBaseUrl: Boolean(DOWNLOAD_LINK_BASE_URL)
+    };
+};
+
+const startDownloadServer = () => {
+    if (downloadServerStarted) return;
+    downloadServerStarted = true;
+
+    const server = createServer((req, res) => {
+        cleanupExpiredDownloadLinks();
+
+        if (!req.url || req.method !== 'GET') {
+            res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Method not allowed');
+            return;
+        }
+
+        let requestUrl;
+        try {
+            requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        } catch {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Invalid request');
+            return;
+        }
+
+        const tokenMatch = requestUrl.pathname.match(/^\/download\/history-db\/([a-f0-9]+)$/i);
+        if (!tokenMatch) {
+            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Not found');
+            return;
+        }
+
+        const token = tokenMatch[1];
+        const tokenEntry = downloadLinkTokens.get(token);
+        if (!tokenEntry || tokenEntry.type !== 'history_db' || tokenEntry.expiresAt <= Date.now()) {
+            downloadLinkTokens.delete(token);
+            res.writeHead(410, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('This download link has expired.');
+            return;
+        }
+
+        const historyDbPath = getHistoryDbPath();
+        if (!fs.existsSync(historyDbPath)) {
+            downloadLinkTokens.delete(token);
+            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('history.db was not found.');
+            return;
+        }
+
+        downloadLinkTokens.delete(token);
+        res.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Disposition': 'attachment; filename="history.db"',
+            'Cache-Control': 'no-store'
+        });
+
+        const readStream = fs.createReadStream(historyDbPath);
+        readStream.on('error', () => {
+            if (!res.headersSent) {
+                res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+            }
+            res.end('Failed to stream history.db.');
+        });
+        readStream.pipe(res);
+    });
+
+    server.listen(DOWNLOAD_LINK_PORT, '0.0.0.0', () => {
+        console.log(`Temporary download server listening on port ${DOWNLOAD_LINK_PORT}`);
+    });
+};
 
 const listCsvFilesInFolder = (folderName) => {
     const safeFolderName = path.basename(folderName || '');
@@ -108,7 +229,9 @@ const listResultFoldersWithCsv = () => {
 };
 
 const RESULTS_ROOT_PAGE_SIZE = 8;
+const DOMAIN_VARIABLES_PAGE_SIZE = 8;
 const resultsViewStates = new Map();
+const domainVariableViewStates = new Map();
 
 const getResultsViewState = (chatId) =>
     resultsViewStates.get(chatId.toString()) || { page: 0, query: '' };
@@ -130,6 +253,22 @@ const setResultsViewState = (chatId, state = {}) => {
 
 const clearResultsViewState = (chatId) => {
     resultsViewStates.set(chatId.toString(), { page: 0, query: '' });
+};
+
+const getDomainVariableViewState = (chatId) =>
+    domainVariableViewStates.get(chatId.toString()) || { page: 0 };
+
+const setDomainVariableViewState = (chatId, state = {}) => {
+    const currentState = getDomainVariableViewState(chatId);
+    const nextPage = Object.prototype.hasOwnProperty.call(state, 'page')
+        ? Math.max(0, Number(state.page) || 0)
+        : currentState.page;
+
+    domainVariableViewStates.set(chatId.toString(), { page: nextPage });
+};
+
+const clearDomainVariableViewState = (chatId) => {
+    domainVariableViewStates.set(chatId.toString(), { page: 0 });
 };
 
 const getResultsRootMenuState = (chatId) => {
@@ -176,6 +315,9 @@ const buildResultsRootKeyboard = (menuState) => {
         inlineKeyboard.push([
             { text: '🗄️ history.db backup', callback_data: 'results_root_db' }
         ]);
+        inlineKeyboard.push([
+            { text: '🌐 history.db browser link', callback_data: 'results_root_db_link' }
+        ]);
     }
 
     if (menuState.allFolders.length > 0 || menuState.query) {
@@ -211,6 +353,61 @@ const buildResultsRootKeyboard = (menuState) => {
     return { inline_keyboard: inlineKeyboard };
 };
 
+const getDomainVariableMenuState = (chatId) => {
+    const currentState = getDomainVariableViewState(chatId);
+    const domains = listResultFoldersWithCsv();
+    const totalPages = Math.max(1, Math.ceil(domains.length / DOMAIN_VARIABLES_PAGE_SIZE));
+    const safePage = domains.length === 0 ? 0 : Math.min(currentState.page || 0, totalPages - 1);
+
+    setDomainVariableViewState(chatId, { page: safePage });
+
+    return {
+        domains,
+        totalPages,
+        page: safePage,
+        pagedDomains: domains.slice(
+            safePage * DOMAIN_VARIABLES_PAGE_SIZE,
+            (safePage + 1) * DOMAIN_VARIABLES_PAGE_SIZE
+        )
+    };
+};
+
+const formatDomainVariableButtonText = (domain) => {
+    const currentVariable = getDomainVariable(domain);
+    if (!currentVariable) {
+        return `🧩 ${domain}`;
+    }
+
+    const shortVariable = currentVariable.length > 18 ? `${currentVariable.slice(0, 15)}...` : currentVariable;
+    return `🧩 ${domain} • ${shortVariable}`;
+};
+
+const buildDomainVariableKeyboard = (menuState) => {
+    const inlineKeyboard = menuState.pagedDomains.map(domain => ([
+        { text: formatDomainVariableButtonText(domain), callback_data: `domain_variable_select:${domain}` }
+    ]));
+
+    if (menuState.totalPages > 1) {
+        inlineKeyboard.push([
+            { text: '⬅️ Prev', callback_data: 'domain_variable_page:prev' },
+            { text: `📄 ${menuState.page + 1}/${menuState.totalPages}`, callback_data: 'domain_variable_page:stay' },
+            { text: 'Next ➡️', callback_data: 'domain_variable_page:next' }
+        ]);
+    }
+
+    inlineKeyboard.push([
+        { text: '⬅️ Back to Results', callback_data: 'home_section:results' }
+    ]);
+
+    return { inline_keyboard: inlineKeyboard };
+};
+
+const buildDomainVariablePromptKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '⬅️ Back to Domain Variables', callback_data: 'home_open:domain_variables' }]
+    ]
+});
+
 const buildFolderFilesKeyboard = (folderName) => {
     const safeFolderName = path.basename(folderName || '');
     const inlineKeyboard = [[
@@ -224,6 +421,106 @@ const buildFolderFilesKeyboard = (folderName) => {
     });
 
     return { inline_keyboard: inlineKeyboard };
+};
+
+const parseCsvLine = (line) => {
+    const values = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+
+        if (char === '"') {
+            if (inQuotes && line[i + 1] === '"') {
+                current += '"';
+                i++;
+            } else {
+                inQuotes = !inQuotes;
+            }
+            continue;
+        }
+
+        if (char === ',' && !inQuotes) {
+            values.push(current);
+            current = '';
+            continue;
+        }
+
+        current += char;
+    }
+
+    values.push(current);
+    return values;
+};
+
+const escapeCsvCell = (value) => {
+    const stringValue = value === null || value === undefined ? '' : String(value);
+    if (/[",\n]/.test(stringValue)) {
+        return `"${stringValue.replace(/"/g, '""')}"`;
+    }
+    return stringValue;
+};
+
+const serializeCsvLine = (values) => values.map(escapeCsvCell).join(',');
+
+const rewriteCsvFile = (filePath, transformRows) => {
+    if (!fs.existsSync(filePath)) return;
+
+    const content = fs.readFileSync(filePath, 'utf8');
+    if (!content.trim()) return;
+
+    const lines = content.split('\n');
+    const header = parseCsvLine(lines[0]);
+    let variableIndex = header.indexOf('Domain Variable');
+
+    if (variableIndex === -1) {
+        header.push('Domain Variable');
+        variableIndex = header.length - 1;
+    }
+
+    const rewrittenLines = lines.map((line, index) => {
+        if (!line.trim()) return line;
+        if (index === 0) return serializeCsvLine(header);
+
+        const values = parseCsvLine(line);
+        while (values.length <= variableIndex) {
+            values.push('');
+        }
+
+        return serializeCsvLine(transformRows(values, { header, variableIndex }));
+    });
+
+    fs.writeFileSync(filePath, rewrittenLines.join('\n'));
+};
+
+const syncDomainVariableToResultFiles = (domain, variable) => {
+    const safeDomain = String(domain || '').trim().toLowerCase().replace(/^www\./, '');
+    const normalizedVariable = String(variable || '').trim();
+    if (!safeDomain || !normalizedVariable) return;
+
+    const allResultsPath = getAllResultsPath();
+    rewriteCsvFile(allResultsPath, (values, { header, variableIndex }) => {
+        const domainIndex = header.indexOf('Domain');
+        const rowDomain = String(values[domainIndex] || '').trim().toLowerCase().replace(/^www\./, '');
+        if (rowDomain === safeDomain) {
+            values[variableIndex] = normalizedVariable;
+        }
+        return values;
+    });
+
+    const domainDir = path.join(getResultDirPath(), safeDomain);
+    if (!fs.existsSync(domainDir)) return;
+
+    fs.readdirSync(domainDir, { withFileTypes: true })
+        .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.csv'))
+        .forEach(entry => {
+            const filePath = path.join(domainDir, entry.name);
+            rewriteCsvFile(filePath, (values, { variableIndex }) => {
+                values[variableIndex] = normalizedVariable;
+                return values;
+            });
+        });
 };
 
 const sendDocumentFile = (chatId, filePath, caption) =>
@@ -321,6 +618,36 @@ const showResultsRootMenu = async (chatId, message = null, statusLine = '') => {
     }
 
     await sendOrEditMenu(chatId, lines.join('\n'), keyboard, message);
+};
+
+const showDomainVariableMenu = async (chatId, message = null, statusLine = '') => {
+    const menuState = getDomainVariableMenuState(chatId);
+    if (menuState.domains.length === 0) {
+        await sendOrEditMenu(chatId, 'No result domains are available yet.', buildResultsMenuKeyboard(), message);
+        return;
+    }
+
+    const lines = ['Choose a domain to set its variable:'];
+    if (menuState.totalPages > 1) {
+        lines.push(`📄 Page: ${menuState.page + 1}/${menuState.totalPages}`);
+    }
+    if (statusLine) {
+        lines.push(statusLine);
+    }
+
+    await sendOrEditMenu(chatId, lines.join('\n'), buildDomainVariableKeyboard(menuState), message);
+};
+
+const buildDomainVariablePromptText = (domain) => {
+    const currentVariable = getDomainVariable(domain);
+    return [
+        'Domain Variable',
+        `Domain: ${domain}`,
+        `Current: ${currentVariable || 'Not Set'}`,
+        '',
+        'Send the variable in your next message.',
+        'Example: NY Weekly'
+    ].join('\n');
 };
 
 const showFolderFilesMenu = async (chatId, folderName, message = null, statusLine = '') => {
@@ -629,6 +956,7 @@ const buildPageTrackerScheduleKeyboard = () => {
 const buildResultsMenuKeyboard = () => ({
     inline_keyboard: [
         [{ text: '📂 Download Results', callback_data: 'home_open:download_results' }],
+        [{ text: '🧩 Domain Variable', callback_data: 'home_open:domain_variables' }],
         [{ text: '📤 Export URLs', callback_data: 'home_usage:export_urls' }],
         [{ text: '♻️ Retry URLs', callback_data: 'home_open:retry_menu' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
@@ -914,6 +1242,7 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 // Create a bot that uses 'polling' to fetch new updates
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 initializeScraper();
+startDownloadServer();
 bot.setMyCommands(BOT_COMMANDS).catch(error => {
     console.error(`Failed to set Telegram bot commands: ${error.message}`);
 });
@@ -1913,6 +2242,24 @@ bot.on('message', async (msg) => {
         return;
     }
 
+    if (pendingInput.type === 'domain_variable_set') {
+        const variable = String(msg.text || '').trim();
+        if (!variable) {
+            await sendPlainMessage('Send the variable text for this domain.', msg.chat.id);
+            return;
+        }
+
+        clearPendingChatInput(msg.chat.id);
+        const savedVariable = setDomainVariable(pendingInput.domain, variable);
+        syncDomainVariableToResultFiles(savedVariable.domain, savedVariable.variable);
+        await showDomainVariableMenu(
+            msg.chat.id,
+            pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
+            `✅ ${savedVariable.domain} → ${savedVariable.variable}`
+        );
+        return;
+    }
+
     if (pendingInput.type === 'results_search') {
         const query = String(msg.text || '').trim();
         if (!query) {
@@ -2282,6 +2629,13 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
     }
 
+    if (data === 'home_open:domain_variables') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        clearDomainVariableViewState(msg.chat.id);
+        await showDomainVariableMenu(msg.chat.id, msg);
+        return;
+    }
+
     if (data === 'home_open:retry_menu') {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await sendOrEditMenu(msg.chat.id, 'Choose which URLs to retry:', buildRetryTypeKeyboard(), msg);
@@ -2628,6 +2982,51 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
     }
 
+    if (data.startsWith('domain_variable_page:')) {
+        const direction = path.basename(data.replace('domain_variable_page:', ''));
+        const currentState = getDomainVariableViewState(msg.chat.id);
+
+        if (direction === 'prev') {
+            setDomainVariableViewState(msg.chat.id, { page: Math.max(0, (currentState.page || 0) - 1) });
+            await safeAnswerCallbackQuery(callbackQuery.id);
+            await showDomainVariableMenu(msg.chat.id, msg);
+            return;
+        }
+
+        if (direction === 'next') {
+            setDomainVariableViewState(msg.chat.id, { page: (currentState.page || 0) + 1 });
+            await safeAnswerCallbackQuery(callbackQuery.id);
+            await showDomainVariableMenu(msg.chat.id, msg);
+            return;
+        }
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        return;
+    }
+
+    if (data.startsWith('domain_variable_select:')) {
+        const domain = path.basename(data.replace('domain_variable_select:', '')).toLowerCase();
+        if (!listResultFoldersWithCsv().includes(domain)) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Domain is no longer available', show_alert: true });
+            return;
+        }
+
+        setPendingChatInput(msg.chat.id, {
+            type: 'domain_variable_set',
+            domain,
+            menuMessageId: msg.message_id
+        });
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            buildDomainVariablePromptText(domain),
+            buildDomainVariablePromptKeyboard(),
+            msg
+        );
+        return;
+    }
+
     if (data === 'results_root_db') {
         const historyDbPath = getHistoryDbPath();
         if (!fs.existsSync(historyDbPath)) {
@@ -2646,6 +3045,23 @@ bot.on('callback_query', async (callbackQuery) => {
             console.error(`Failed to send history.db backup: ${error.message}`);
             await showResultsRootMenu(msg.chat.id, msg, '❌ Failed to send history.db backup');
         }
+        return;
+    }
+
+    if (data === 'results_root_db_link') {
+        const historyDbPath = getHistoryDbPath();
+        if (!fs.existsSync(historyDbPath)) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'File no longer exists', show_alert: true });
+            return;
+        }
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        const linkInfo = createHistoryDbDownloadLink();
+        const statusLine = linkInfo.configuredBaseUrl
+            ? `🔗 Browser link ready (30 min):\n${linkInfo.url}`
+            : `🔗 Browser link ready (30 min):\n${linkInfo.url}\n⚠️ Set DOWNLOAD_LINK_BASE_URL for a public browser-friendly URL.`;
+
+        await showResultsRootMenu(msg.chat.id, msg, statusLine);
         return;
     }
 

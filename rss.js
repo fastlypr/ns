@@ -42,6 +42,10 @@ function compileRegexList(patterns) {
     return patterns.map((p) => new RegExp(p));
 }
 
+function escapeRegex(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function normalizeUrl(inputUrl, baseUrl, keepQueryString = false) {
     const u = new URL(inputUrl, baseUrl);
     u.hash = '';
@@ -140,6 +144,269 @@ function formatScrapedAt(date = new Date()) {
 function trimTrailingSlash(p) {
     if (p === '/') return '/';
     return p.endsWith('/') ? p.slice(0, -1) : p;
+}
+
+const MEDIUM_RESERVED_FIRST_SEGMENTS = new Set([
+    'about',
+    'feed',
+    'jobs-at-medium',
+    'm',
+    'me',
+    'members-only',
+    'notifications',
+    'p',
+    'search',
+    'signin',
+    'tag',
+    'topics'
+]);
+
+function getMediumPublicationFeedInfo(pageUrl) {
+    try {
+        const parsed = new URL(pageUrl);
+        if (parsed.hostname !== 'medium.com') return null;
+
+        const segments = parsed.pathname.split('/').filter(Boolean);
+        if (segments.length !== 1) return null;
+
+        const publicationSlug = segments[0];
+        if (!publicationSlug || MEDIUM_RESERVED_FIRST_SEGMENTS.has(publicationSlug.toLowerCase())) {
+            return null;
+        }
+
+        return {
+            publicationSlug,
+            originalUrl: normalizeUrl(pageUrl, pageUrl, true),
+            feedUrl: `https://medium.com/feed/${publicationSlug}`
+        };
+    } catch {
+        return null;
+    }
+}
+
+function mergeTrackedRows(byUrl, rows) {
+    for (const row of rows) {
+        if (!row?.url) continue;
+        const existing = byUrl.get(row.url);
+        if (!existing) {
+            byUrl.set(row.url, {
+                url: row.url,
+                publishedAt: row.publishedAt || null,
+                sourcePaths: new Set(Array.from(row.sourcePaths ?? []).filter(Boolean))
+            });
+            continue;
+        }
+
+        if (!existing.publishedAt && row.publishedAt) {
+            existing.publishedAt = row.publishedAt;
+        }
+
+        for (const sourcePath of row.sourcePaths ?? []) {
+            if (sourcePath) existing.sourcePaths.add(sourcePath);
+        }
+    }
+}
+
+function collectNewUrlsFromRows(rows, seenSet, newlyDiscovered) {
+    for (const row of rows) {
+        const link = row?.url;
+        if (!link) continue;
+        if (seenSet.has(link)) continue;
+        if (urlExists(link)) {
+            seenSet.add(link);
+            continue;
+        }
+        newlyDiscovered.push(link);
+        seenSet.add(link);
+    }
+}
+
+function extractFeedRowsFromXml(xml, startUrl, keepQueryString, sourcePath) {
+    const $ = cheerio.load(xml, { xmlMode: true });
+    const rssItems = $('item')
+        .map((_, el) => {
+            const link = ($(el).find('link').first().text() || '').trim();
+            const pubDate = ($(el).find('pubDate').first().text() || '').trim();
+            const dcDate = ($(el).find('dc\\:date').first().text() || '').trim();
+            const publishedAt = parsePublishedDateToIso(pubDate) || parsePublishedDateToIso(dcDate) || null;
+            return { link, publishedAt };
+        })
+        .get()
+        .filter((x) => x.link);
+
+    const atomEntries = $('entry')
+        .map((_, el) => {
+            const link = ($(el).find('link[rel="alternate"]').first().attr('href') || '').trim();
+            const published = ($(el).find('published').first().text() || '').trim();
+            const updated = ($(el).find('updated').first().text() || '').trim();
+            const publishedAt = parsePublishedDateToIso(published) || parsePublishedDateToIso(updated) || null;
+            return { link, publishedAt };
+        })
+        .get()
+        .filter((x) => x.link);
+
+    const rows = [];
+    for (const item of [...rssItems, ...atomEntries]) {
+        try {
+            rows.push({
+                url: normalizeUrl(item.link, startUrl, keepQueryString),
+                publishedAt: item.publishedAt,
+                sourcePaths: new Set([sourcePath])
+            });
+        } catch {
+        }
+    }
+
+    return rows;
+}
+
+function buildMediumPublicationArticleRegex(publicationSlug) {
+    const escapedSlug = escapeRegex(publicationSlug);
+    return new RegExp(`https?:\\/\\/medium\\.com\\/${escapedSlug}\\/[a-z0-9-]+-[a-f0-9]{8,}`, 'gi');
+}
+
+function extractMediumJsonRows(rawText, publicationSlug, sourcePath) {
+    const cleaned = String(rawText || '')
+        .replace(/^\]\)\}while\(1\);<\/x>/, '')
+        .replace(/\\\//g, '/');
+    const matches = cleaned.match(buildMediumPublicationArticleRegex(publicationSlug)) || [];
+    const uniqueRows = new Map();
+
+    for (const matchedUrl of matches) {
+        try {
+            const normalized = normalizeUrl(matchedUrl, matchedUrl, false);
+            if (!uniqueRows.has(normalized)) {
+                uniqueRows.set(normalized, {
+                    url: normalized,
+                    publishedAt: null,
+                    sourcePaths: new Set([sourcePath])
+                });
+            }
+        } catch {
+        }
+    }
+
+    return Array.from(uniqueRows.values());
+}
+
+async function processMediumPublicationTrackedPage(entry, configDefaults, state, mediumFeedInfo) {
+    const name = entry.name || entry.startUrl;
+    const startUrl = entry.startUrl;
+    const outputBase = entry.outputFileBase || outputBaseFromStartUrl(startUrl);
+    const sourcePath = trimTrailingSlash(new URL(startUrl).pathname || '/');
+
+    const timeoutMs = entry.timeoutMs ?? configDefaults.timeoutMs ?? 30000;
+    const retryLimit = entry.retryLimit ?? configDefaults.retryLimit ?? 2;
+    const maxPages = entry.maxPages ?? configDefaults.maxPages ?? 10;
+    const sameHostOnly = entry.sameHostOnly ?? configDefaults.sameHostOnly ?? true;
+    const keepQueryString = entry.keepQueryString ?? configDefaults.keepQueryString ?? false;
+    const excludedExtensions = entry.excludedExtensions ?? configDefaults.excludedExtensions ?? [];
+    const aggressiveLinkExtraction = entry.aggressiveLinkExtraction ?? configDefaults.aggressiveLinkExtraction ?? false;
+
+    const includePathRegex = (Array.isArray(entry.includePathRegex) && entry.includePathRegex.length > 0)
+        ? entry.includePathRegex
+        : [`^/${escapeRegex(mediumFeedInfo.publicationSlug)}/.+-[a-f0-9]{8,}$`];
+    const excludePathRegex = [
+        ...(configDefaults.excludePathRegex ?? []),
+        ...(entry.excludePathRegex ?? []),
+        '^/$',
+        '^/about(?:/.*)?$',
+        '^/feed(?:/.*)?$',
+        '^/followers(?:/.*)?$',
+        '^/jobs-at-medium(?:/.*)?$',
+        '^/m(?:/.*)?$',
+        '^/notifications(?:/.*)?$',
+        '^/p/[a-f0-9]+$',
+        '^/search(?:/.*)?$',
+        '^/signin(?:/.*)?$',
+        '^/tag(?:/.*)?$',
+        `^/${escapeRegex(mediumFeedInfo.publicationSlug)}/about(?:/.*)?$`,
+        `^/${escapeRegex(mediumFeedInfo.publicationSlug)}/followers(?:/.*)?$`,
+        `^/${escapeRegex(mediumFeedInfo.publicationSlug)}/subpage(?:/.*)?$`
+    ];
+
+    const seenSet = new Set(state.seen?.[name] ?? []);
+    const newlyDiscovered = [];
+    const byUrl = new Map();
+
+    try {
+        log('INFO', `Fetching Medium publication feed: ${mediumFeedInfo.feedUrl}`);
+        const feedXml = await fetchText(mediumFeedInfo.feedUrl, { timeoutMs, retryLimit });
+        const feedRows = extractFeedRowsFromXml(feedXml, mediumFeedInfo.feedUrl, keepQueryString, sourcePath);
+        mergeTrackedRows(byUrl, feedRows);
+        collectNewUrlsFromRows(feedRows, seenSet, newlyDiscovered);
+    } catch (err) {
+        log('ERROR', `Failed to fetch Medium feed ${mediumFeedInfo.feedUrl}`, err?.message || String(err));
+    }
+
+    try {
+        const mediumJsonUrl = `${startUrl}${startUrl.includes('?') ? '&' : '?'}format=json`;
+        log('INFO', `Fetching Medium publication JSON: ${mediumJsonUrl}`);
+        const rawJson = await fetchText(mediumJsonUrl, { timeoutMs, retryLimit });
+        const jsonRows = extractMediumJsonRows(rawJson, mediumFeedInfo.publicationSlug, sourcePath);
+        mergeTrackedRows(byUrl, jsonRows);
+        collectNewUrlsFromRows(jsonRows, seenSet, newlyDiscovered);
+    } catch (err) {
+        log('ERROR', `Failed to fetch Medium JSON ${startUrl}`, err?.message || String(err));
+    }
+
+    let currentUrl = startUrl;
+    for (let i = 0; i < maxPages; i++) {
+        log('INFO', `Fetching Medium publication page: ${currentUrl}`);
+        let html;
+        try {
+            html = await fetchText(currentUrl, { timeoutMs, retryLimit });
+        } catch (err) {
+            log('ERROR', `Failed to fetch ${currentUrl}`, err?.message || String(err));
+            break;
+        }
+
+        let entries;
+        try {
+            entries = extractArticleEntriesFromHtml(html, currentUrl, {
+                sameHostOnly,
+                keepQueryString,
+                excludedExtensions,
+                includePathRegex,
+                excludePathRegex,
+                aggressiveLinkExtraction
+            });
+        } catch (err) {
+            log('ERROR', `Failed to parse ${currentUrl}`, err?.message || String(err));
+            break;
+        }
+
+        mergeTrackedRows(byUrl, entries.map((entryRow) => ({
+            ...entryRow,
+            sourcePaths: new Set([sourcePath])
+        })));
+        collectNewUrlsFromRows(entries, seenSet, newlyDiscovered);
+
+        const nextUrl = extractNextPageUrlFromHtml(html, currentUrl);
+        if (!nextUrl || nextUrl === currentUrl) {
+            break;
+        }
+        currentUrl = nextUrl;
+    }
+
+    state.seen[name] = Array.from(seenSet).slice(-50000);
+
+    const queuePath = writeQueueFile(name, newlyDiscovered);
+    if (queuePath) {
+        log('INFO', `Queued ${newlyDiscovered.length} new URL(s)`, queuePath);
+    } else {
+        log('INFO', `No new URLs found for ${name}`);
+    }
+
+    return {
+        outputBase,
+        rows: Array.from(byUrl.values()),
+        newUrlsCount: newlyDiscovered.length,
+        queuePath,
+        sourceName: name,
+        sourceUrl: startUrl,
+        trackedPageId: entry.id ?? null
+    };
 }
 
 function outputBaseFromStartUrl(startUrl) {
@@ -590,6 +857,11 @@ async function processHtmlTrackedPage(entry, configDefaults, state) {
     const startUrl = entry.startUrl;
     const outputBase = entry.outputFileBase || outputBaseFromStartUrl(startUrl);
     const sourcePath = trimTrailingSlash(new URL(startUrl).pathname || '/');
+    const mediumFeedInfo = getMediumPublicationFeedInfo(startUrl);
+
+    if (mediumFeedInfo) {
+        return processMediumPublicationTrackedPage(entry, configDefaults, state, mediumFeedInfo);
+    }
 
     const timeoutMs = entry.timeoutMs ?? configDefaults.timeoutMs ?? 30000;
     const retryLimit = entry.retryLimit ?? configDefaults.retryLimit ?? 2;
@@ -685,8 +957,9 @@ async function processHtmlTrackedPage(entry, configDefaults, state) {
 async function processRssTrackedPage(entry, configDefaults, state) {
     const name = entry.name || entry.startUrl;
     const startUrl = entry.startUrl;
+    const originalTrackedUrl = entry.originalTrackedUrl || startUrl;
     const outputBase = entry.outputFileBase || outputBaseFromStartUrl(startUrl);
-    const sourcePath = trimTrailingSlash(new URL(startUrl).pathname || '/');
+    const sourcePath = entry.sourcePathOverride || trimTrailingSlash(new URL(originalTrackedUrl).pathname || '/');
 
     const timeoutMs = entry.timeoutMs ?? configDefaults.timeoutMs ?? 30000;
     const retryLimit = entry.retryLimit ?? configDefaults.retryLimit ?? 2;
@@ -704,55 +977,15 @@ async function processRssTrackedPage(entry, configDefaults, state) {
         return;
     }
 
-    let items = [];
+    let rssRows = [];
     try {
-        const $ = cheerio.load(xml, { xmlMode: true });
-        const rssItems = $('item')
-            .map((_, el) => {
-                const link = ($(el).find('link').first().text() || '').trim();
-                const pubDate = ($(el).find('pubDate').first().text() || '').trim();
-                const dcDate = ($(el).find('dc\\:date').first().text() || '').trim();
-                const publishedAt = parsePublishedDateToIso(pubDate) || parsePublishedDateToIso(dcDate) || null;
-                return { link, publishedAt };
-            })
-            .get()
-            .filter((x) => x.link);
-
-        const atomEntries = $('entry')
-            .map((_, el) => {
-                const link = ($(el).find('link[rel="alternate"]').first().attr('href') || '').trim();
-                const published = ($(el).find('published').first().text() || '').trim();
-                const updated = ($(el).find('updated').first().text() || '').trim();
-                const publishedAt = parsePublishedDateToIso(published) || parsePublishedDateToIso(updated) || null;
-                return { link, publishedAt };
-            })
-            .get()
-            .filter((x) => x.link);
-
-        items = [...rssItems, ...atomEntries];
+        rssRows = extractFeedRowsFromXml(xml, startUrl, keepQueryString, sourcePath);
     } catch (err) {
         log('ERROR', `Failed to parse feed ${startUrl}`, err?.message || String(err));
         return;
     }
 
-    const rssRows = [];
-    for (const item of items) {
-        const link = item.link;
-        let absolute;
-        try {
-            absolute = normalizeUrl(link, startUrl, keepQueryString);
-        } catch {
-            continue;
-        }
-        rssRows.push({ url: absolute, publishedAt: item.publishedAt, sourcePaths: new Set([sourcePath]) });
-        if (seenSet.has(absolute)) continue;
-        if (urlExists(absolute)) {
-            seenSet.add(absolute);
-            continue;
-        }
-        newlyDiscovered.push(absolute);
-        seenSet.add(absolute);
-    }
+    collectNewUrlsFromRows(rssRows, seenSet, newlyDiscovered);
 
     state.seen[name] = Array.from(seenSet).slice(-50000);
     const queuePath = writeQueueFile(name, newlyDiscovered);
@@ -768,7 +1001,7 @@ async function processRssTrackedPage(entry, configDefaults, state) {
         newUrlsCount: newlyDiscovered.length,
         queuePath,
         sourceName: name,
-        sourceUrl: startUrl,
+        sourceUrl: originalTrackedUrl,
         trackedPageId: entry.id ?? null
     };
 }

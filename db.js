@@ -36,6 +36,11 @@ db.exec(`
         key TEXT PRIMARY KEY,
         value TEXT
     );
+    CREATE TABLE IF NOT EXISTS domain_variables (
+        domain TEXT PRIMARY KEY,
+        variable TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
 `);
 
 // Add new column to scraped_urls if it doesn't exist (Migration)
@@ -81,6 +86,8 @@ const getTrackedPagesStmt = db.prepare('SELECT * FROM tracked_pages ORDER BY ena
 const getTrackedPageByIdStmt = db.prepare('SELECT * FROM tracked_pages WHERE id = ?');
 const updateTrackedPageEnabledStmt = db.prepare('UPDATE tracked_pages SET enabled = ? WHERE id = ?');
 const deleteTrackedPageStmt = db.prepare('DELETE FROM tracked_pages WHERE id = ?');
+const getDomainVariableStmt = db.prepare('SELECT variable FROM domain_variables WHERE domain = ?');
+const upsertDomainVariableStmt = db.prepare('INSERT OR REPLACE INTO domain_variables (domain, variable, updated_at) VALUES (?, ?, ?)');
 const updateTrackedPageRunResultStmt = db.prepare(`
     UPDATE tracked_pages
     SET last_run_at = ?, last_status = ?, last_new_urls = ?
@@ -97,6 +104,10 @@ const upsertSettingStmt = db.prepare('INSERT OR REPLACE INTO app_settings (key, 
 export function normalizeUrl(url) {
     if (!url) return '';
     return url.replace(/\/$/, '');
+}
+
+function normalizeDomain(domain) {
+    return String(domain || '').trim().toLowerCase().replace(/^www\./, '');
 }
 
 function normalizeStatus(status) {
@@ -318,6 +329,27 @@ export function setPageTrackerSchedule(intervalHours, enabled = true) {
 export function setPageTrackerEnabled(enabled) {
     const current = getPageTrackerSchedule();
     return setPageTrackerSchedule(current.intervalHours, enabled);
+}
+
+export function getDomainVariable(domain) {
+    const normalizedDomain = normalizeDomain(domain);
+    if (!normalizedDomain) return '';
+    const row = getDomainVariableStmt.get(normalizedDomain);
+    return row?.variable ? String(row.variable).trim() : '';
+}
+
+export function setDomainVariable(domain, variable) {
+    const normalizedDomain = normalizeDomain(domain);
+    const normalizedVariable = String(variable || '').trim();
+    if (!normalizedDomain || !normalizedVariable) {
+        throw new Error('Domain and variable are required');
+    }
+
+    upsertDomainVariableStmt.run(normalizedDomain, normalizedVariable, new Date().toISOString());
+    return {
+        domain: normalizedDomain,
+        variable: normalizedVariable
+    };
 }
 
 export function getPageTrackerLastSummary() {
