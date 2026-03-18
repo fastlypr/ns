@@ -18,6 +18,36 @@ let scraperInitialized = false;
 const PROXY_MODE_FILE = path.join(process.cwd(), 'proxy_mode.txt');
 const PROXY_LIST_FILE = path.join(process.cwd(), 'proxies.txt');
 const CRAWLBASE_TOKEN_FILE = path.join(process.cwd(), 'crawlbase_token.txt');
+const ARTICLE_URL_IGNORED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.pdf', '.xml', '.rss', '.atom', '.json', '.js', '.css', '.ico', '.mp4', '.mp3', '.txt', '.csv', '.zip'];
+const ARTICLE_URL_EXCLUDED_SEGMENTS = new Set([
+    'about',
+    'account',
+    'author',
+    'authors',
+    'cart',
+    'category',
+    'checkout',
+    'contact',
+    'feed',
+    'followers',
+    'login',
+    'm',
+    'page',
+    'privacy',
+    'product',
+    'products',
+    'search',
+    'shop',
+    'signin',
+    'signup',
+    'sitemap',
+    'subpage',
+    'tag',
+    'tags',
+    'terms',
+    'wp-admin',
+    'wp-content'
+]);
 
 function normalizeProxyMode(mode) {
     const normalized = String(mode || '').trim().toUpperCase();
@@ -229,6 +259,78 @@ function ensureScraperInitialized() {
     if (!scraperInitialized) {
         initializeScraper();
     }
+}
+
+function normalizeCandidateArticleUrl(rawUrl) {
+    try {
+        const cleaned = String(rawUrl || '').trim().replace(/[)\].,;:!?]+$/g, '');
+        const parsed = new URL(cleaned);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        parsed.hash = '';
+        parsed.search = '';
+        parsed.username = '';
+        parsed.password = '';
+        let normalized = parsed.toString();
+        if (normalized.endsWith('/') && parsed.pathname !== '/') {
+            normalized = normalized.slice(0, -1);
+        }
+        return normalized;
+    } catch {
+        return null;
+    }
+}
+
+function scoreArticleUrl(urlStr) {
+    try {
+        const parsed = new URL(urlStr);
+        const lowerHost = parsed.hostname.toLowerCase();
+        const lowerPath = parsed.pathname.toLowerCase();
+        const segments = lowerPath.split('/').filter(Boolean);
+
+        if (ARTICLE_URL_IGNORED_EXTENSIONS.some(ext => lowerPath.endsWith(ext))) return -10;
+        if (lowerHost.startsWith('miro.') || lowerHost.startsWith('cdn.') || lowerHost.startsWith('images.')) return -10;
+        if (segments.length === 0) return -10;
+        if (segments.some(segment => ARTICLE_URL_EXCLUDED_SEGMENTS.has(segment))) return -6;
+
+        const lastSegment = segments[segments.length - 1] || '';
+        let score = 0;
+
+        if (segments.length >= 2) score += 2;
+        if (lastSegment.includes('-')) score += 2;
+        if (lastSegment.length >= 16) score += 1;
+        if (/\d{4}/.test(lowerPath)) score += 1;
+        if (/[a-f0-9]{8,}/.test(lastSegment)) score += 1;
+
+        return score;
+    } catch {
+        return -10;
+    }
+}
+
+export function extractSmartArticleUrls(rawText) {
+    const matches = String(rawText || '').match(/https?:\/\/[^\s"'<>`]+/g) || [];
+    const scoredUrls = new Map();
+
+    matches.forEach(match => {
+        const normalized = normalizeCandidateArticleUrl(match);
+        if (!normalized) return;
+
+        const score = scoreArticleUrl(normalized);
+        const existing = scoredUrls.get(normalized);
+        if (existing === undefined || score > existing) {
+            scoredUrls.set(normalized, score);
+        }
+    });
+
+    const articleLikeUrls = Array.from(scoredUrls.entries())
+        .filter(([, score]) => score >= 2)
+        .map(([url]) => url);
+
+    if (articleLikeUrls.length > 0) {
+        return articleLikeUrls;
+    }
+
+    return Array.from(scoredUrls.keys());
 }
 
 /**
@@ -949,7 +1051,7 @@ export async function scrapeUrlsFromInputFile(filePath, options = {}) {
     }
 
     const content = fs.readFileSync(filePath, 'utf8');
-    const fileUrls = content.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const fileUrls = extractSmartArticleUrls(content);
 
     if (fileUrls.length > 0) {
         console.log(`Processing ${fileUrls.length} URLs from ${filePath}...`);
@@ -985,11 +1087,7 @@ export async function processToScrapeFolder(toScrapeDir, options = {}) {
         for (const file of files) {
             const filePath = path.join(toScrapeDir, file);
             const content = fs.readFileSync(filePath, 'utf8');
-            const urls = [];
-            content.split('\n').forEach(line => {
-                const trimmed = line.trim();
-                if (trimmed && trimmed.startsWith('http')) urls.push(trimmed);
-            });
+            const urls = extractSmartArticleUrls(content);
 
             if (urls.length > 0) {
                 fileEntries.push({ file, filePath, urls });

@@ -13,6 +13,7 @@ import {
     runScraper,
     processToScrapeFolder,
     initializeScraper,
+    extractSmartArticleUrls,
     getProxyMode,
     setProxyMode,
     getProxyConfigSummary,
@@ -865,7 +866,7 @@ const buildArticleMenuKeyboard = () => ({
     inline_keyboard: [
         [{ text: '🔗 Scrape URL', callback_data: 'home_usage:scrape_url' }],
         [{ text: '📄 Scrape File', callback_data: 'home_open:scrape_file' }],
-        [{ text: '📤 Upload TXT', callback_data: 'home_wait:upload_txt' }],
+        [{ text: '📤 Upload TXT / CSV', callback_data: 'home_wait:upload_txt' }],
         [{ text: '✍️ Paste URLs', callback_data: 'home_wait:paste_urls' }],
         [{ text: '📁 Scrape Folder', callback_data: 'home_action:scrape_folder' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
@@ -2306,9 +2307,9 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    const urls = extractUrlsFromText(msg.text);
+    const urls = extractSmartArticleUrls(msg.text);
     if (urls.length === 0) {
-        await sendPlainMessage('No valid URLs found. Send full http or https URLs.', msg.chat.id);
+        await sendPlainMessage('No valid article URLs found. You can paste plain URLs or CSV text with URLs.', msg.chat.id);
         return;
     }
 
