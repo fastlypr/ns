@@ -384,9 +384,13 @@ const formatDomainVariableButtonText = (domain) => {
 };
 
 const buildDomainVariableKeyboard = (menuState) => {
-    const inlineKeyboard = menuState.pagedDomains.map(domain => ([
+    const inlineKeyboard = [
+        [{ text: '📥 Export CSV', callback_data: 'domain_variable_export_csv' }],
+        [{ text: '📤 Upload CSV', callback_data: 'domain_variable_import_csv_wait' }],
+        ...menuState.pagedDomains.map(domain => ([
         { text: formatDomainVariableButtonText(domain), callback_data: `domain_variable_select:${domain}` }
-    ]));
+        ]))
+    ];
 
     if (menuState.totalPages > 1) {
         inlineKeyboard.push([
@@ -524,6 +528,95 @@ const syncDomainVariableToResultFiles = (domain, variable) => {
         });
 };
 
+const createDomainVariableExportFile = () => {
+    const exportDir = ensureTelegramUploadDir();
+    const exportPath = path.join(exportDir, `domain_variables_${Date.now()}.csv`);
+    const lines = [
+        serializeCsvLine(['Domain', 'Domain Variable']),
+        ...listResultFoldersWithCsv().map(domain =>
+            serializeCsvLine([domain, getDomainVariable(domain)])
+        )
+    ];
+
+    fs.writeFileSync(exportPath, `${lines.join('\n')}\n`);
+    return exportPath;
+};
+
+const normalizeImportHeader = (value) =>
+    String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+
+const importDomainVariablesFromCsv = (filePath) => {
+    const content = fs.readFileSync(filePath, 'utf8');
+    if (!content.trim()) {
+        throw new Error('CSV file is empty');
+    }
+
+    const lines = content.split('\n').filter(line => line.trim());
+    if (lines.length === 0) {
+        throw new Error('CSV file is empty');
+    }
+
+    const header = parseCsvLine(lines[0]).map(normalizeImportHeader);
+    const domainIndex = header.findIndex(value => value === 'domain');
+    const variableIndex = header.findIndex(value =>
+        value === 'domain_variable' || value === 'variable'
+    );
+
+    if (domainIndex === -1 || variableIndex === -1) {
+        throw new Error('CSV must include Domain and Domain Variable columns');
+    }
+
+    const latestByDomain = new Map();
+    let invalidCount = 0;
+    let skippedCount = 0;
+
+    for (let i = 1; i < lines.length; i++) {
+        const values = parseCsvLine(lines[i]);
+        const domain = String(values[domainIndex] || '').trim().toLowerCase().replace(/^www\./, '');
+        const variable = String(values[variableIndex] || '').trim();
+
+        if (!domain && !variable) {
+            continue;
+        }
+
+        if (!domain || !variable) {
+            invalidCount++;
+            continue;
+        }
+
+        const previousValue = latestByDomain.get(domain);
+        if (previousValue === variable) {
+            skippedCount++;
+            continue;
+        }
+
+        latestByDomain.set(domain, variable);
+    }
+
+    let updatedCount = 0;
+    for (const [domain, variable] of latestByDomain.entries()) {
+        const currentVariable = getDomainVariable(domain);
+        if (currentVariable === variable) {
+            skippedCount++;
+            continue;
+        }
+
+        setDomainVariable(domain, variable);
+        syncDomainVariableToResultFiles(domain, variable);
+        updatedCount++;
+    }
+
+    return {
+        updatedCount,
+        skippedCount,
+        invalidCount
+    };
+};
+
 const sendDocumentFile = (chatId, filePath, caption) =>
     bot.sendDocument(chatId, filePath, { caption });
 
@@ -628,7 +721,7 @@ const showDomainVariableMenu = async (chatId, message = null, statusLine = '') =
         return;
     }
 
-    const lines = ['Choose a domain to set its variable:'];
+    const lines = ['Choose a domain to set its variable, or use CSV for bulk update:'];
     if (menuState.totalPages > 1) {
         lines.push(`📄 Page: ${menuState.page + 1}/${menuState.totalPages}`);
     }
@@ -2117,7 +2210,11 @@ bot.on('document', async (msg) => {
     const pendingInput = getPendingChatInput(msg.chat.id);
 
     if (!lowerFileName.endsWith('.txt') && !lowerFileName.endsWith('.csv')) {
-        if (pendingInput?.type === 'upload_txt' || pendingInput?.type === 'upload_sitemap_txt') {
+        if (
+            pendingInput?.type === 'upload_txt' ||
+            pendingInput?.type === 'upload_sitemap_txt' ||
+            pendingInput?.type === 'domain_variable_import_csv'
+        ) {
             await sendPlainMessage('Please send a .txt or .csv file.', msg.chat.id);
         }
         return;
@@ -2127,6 +2224,21 @@ bot.on('document', async (msg) => {
 
     try {
         const filePath = await downloadTelegramInputFile(msg.document);
+        if (pendingInput?.type === 'domain_variable_import_csv') {
+            if (!lowerFileName.endsWith('.csv')) {
+                await sendPlainMessage('Please send a .csv file for bulk domain variable import.', msg.chat.id);
+                return;
+            }
+
+            const result = importDomainVariablesFromCsv(filePath);
+            await showDomainVariableMenu(
+                msg.chat.id,
+                pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
+                `✅ Updated ${result.updatedCount} • Skipped ${result.skippedCount} • Invalid ${result.invalidCount}`
+            );
+            return;
+        }
+
         if (pendingInput?.type === 'upload_sitemap_txt') {
             const sitemapUrls = extractUrlsFromFile(filePath);
             if (sitemapUrls.length === 0) {
@@ -2291,6 +2403,11 @@ bot.on('message', async (msg) => {
             pendingInput.menuMessageId ? { message_id: pendingInput.menuMessageId } : null,
             `✅ ${savedVariable.domain} → ${savedVariable.variable}`
         );
+        return;
+    }
+
+    if (pendingInput.type === 'domain_variable_import_csv') {
+        await sendPlainMessage('Please upload a .csv file for bulk domain variable import.', msg.chat.id);
         return;
     }
 
@@ -3035,6 +3152,40 @@ bot.on('callback_query', async (callbackQuery) => {
         }
 
         await safeAnswerCallbackQuery(callbackQuery.id);
+        return;
+    }
+
+    if (data === 'domain_variable_export_csv') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+
+        try {
+            const exportPath = createDomainVariableExportFile();
+            await sendDocumentFile(msg.chat.id, exportPath, '🧩 domain_variables.csv');
+            await showDomainVariableMenu(msg.chat.id, msg, '✅ domain_variables.csv sent');
+        } catch (error) {
+            await showDomainVariableMenu(msg.chat.id, msg, `❌ Failed to export CSV: ${error.message}`);
+        }
+        return;
+    }
+
+    if (data === 'domain_variable_import_csv_wait') {
+        setPendingChatInput(msg.chat.id, {
+            type: 'domain_variable_import_csv',
+            menuMessageId: msg.message_id
+        });
+
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            [
+                'Bulk Domain Variable Import',
+                '',
+                'Upload a CSV file with these columns:',
+                'Domain, Domain Variable'
+            ].join('\n'),
+            buildDomainVariablePromptKeyboard(),
+            msg
+        );
         return;
     }
 
