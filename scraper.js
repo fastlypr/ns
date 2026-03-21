@@ -840,6 +840,7 @@ function saveResults(result) {
 function removeLineFromFile(filePath, urlToRemove) {
     if (!filePath || !fs.existsSync(filePath)) return;
     try {
+        const normalizedTarget = normalizeCandidateArticleUrl(urlToRemove);
         const content = fs.readFileSync(filePath, 'utf8');
         const lines = content.split('\n');
         const newLines = lines.filter(line => {
@@ -853,6 +854,20 @@ function removeLineFromFile(filePath, urlToRemove) {
             if (trimmed.includes(',')) {
                 const parts = trimmed.split(',');
                 if (parts.some(p => p.trim() === urlToRemove.trim())) return false;
+            }
+
+            if (!normalizedTarget) return true;
+
+            const normalizedLineUrl = normalizeCandidateArticleUrl(trimmed);
+            if (normalizedLineUrl && normalizedLineUrl === normalizedTarget) {
+                return false;
+            }
+
+            if (trimmed.includes(',')) {
+                const parts = trimmed.split(',');
+                if (parts.some(part => normalizeCandidateArticleUrl(part.trim()) === normalizedTarget)) {
+                    return false;
+                }
             }
             
             return true;
