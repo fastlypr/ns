@@ -5,7 +5,7 @@ import readlineSync from 'readline-sync';
 import fs from 'fs';
 import path from 'path';
 import { runSitemapScraper, rescanSavedSitemaps, runBulkSitemapScraper, runSitemapScraperCLI } from './xml.js';
-import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus, getDomainVariable } from './db.js';
+import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus, getDomainVariable, saveSocialLead } from './db.js';
 
 // Configuration
 const TIMEOUT = 15000; // 15 seconds
@@ -798,6 +798,7 @@ function saveResults(result) {
             
             let shouldSave = false;
             let username = '';
+            const category = social.category || 'link';
 
             if (platform === 'instagram') {
                 username = extractUsername(social.link);
@@ -812,11 +813,20 @@ function saveResults(result) {
                 }
             }
 
+            saveSocialLead({
+                domain,
+                platform,
+                sourceUrl: result.source_url,
+                socialLink: social.link,
+                username,
+                category,
+                domainVariable
+            });
+
             if (shouldSave) {
                 const cleanSource = result.source_url.includes(',') ? `"${result.source_url}"` : result.source_url;
                 const cleanLink = social.link.includes(',') ? `"${social.link}"` : social.link;
                 const cleanUser = username;
-                const category = social.category || 'link';
                 
                 // 1. Save to Domain Specific File
                 fs.appendFileSync(filePath, `${cleanSource},${cleanLink},${cleanUser},${category},${timestamp},${escapeCsvCell(domainVariable)}\n`);

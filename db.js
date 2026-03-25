@@ -41,6 +41,21 @@ db.exec(`
         variable TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS social_leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        domain TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        lead_key TEXT NOT NULL,
+        source_url TEXT NOT NULL,
+        social_link TEXT NOT NULL,
+        username TEXT,
+        category TEXT,
+        domain_variable TEXT,
+        discovered_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(domain, platform, lead_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_social_leads_domain_platform ON social_leads(domain, platform);
 `);
 
 // Add new column to scraped_urls if it doesn't exist (Migration)
@@ -88,6 +103,27 @@ const updateTrackedPageEnabledStmt = db.prepare('UPDATE tracked_pages SET enable
 const deleteTrackedPageStmt = db.prepare('DELETE FROM tracked_pages WHERE id = ?');
 const getDomainVariableStmt = db.prepare('SELECT variable FROM domain_variables WHERE domain = ?');
 const upsertDomainVariableStmt = db.prepare('INSERT OR REPLACE INTO domain_variables (domain, variable, updated_at) VALUES (?, ?, ?)');
+const upsertSocialLeadStmt = db.prepare(`
+    INSERT INTO social_leads (
+        domain,
+        platform,
+        lead_key,
+        source_url,
+        social_link,
+        username,
+        category,
+        domain_variable,
+        discovered_at,
+        updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(domain, platform, lead_key) DO UPDATE SET
+        source_url = excluded.source_url,
+        social_link = excluded.social_link,
+        username = excluded.username,
+        category = excluded.category,
+        domain_variable = excluded.domain_variable,
+        updated_at = excluded.updated_at
+`);
 const updateTrackedPageRunResultStmt = db.prepare(`
     UPDATE tracked_pages
     SET last_run_at = ?, last_status = ?, last_new_urls = ?
@@ -108,6 +144,71 @@ export function normalizeUrl(url) {
 
 function normalizeDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^www\./, '');
+}
+
+function normalizeSocialLink(url) {
+    try {
+        const parsed = new URL(String(url || '').trim());
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            return normalizeUrl(String(url || '').trim()).toLowerCase();
+        }
+
+        parsed.hash = '';
+        parsed.search = '';
+        parsed.username = '';
+        parsed.password = '';
+
+        let normalized = parsed.toString();
+        if (normalized.endsWith('/') && parsed.pathname !== '/') {
+            normalized = normalized.slice(0, -1);
+        }
+
+        return normalized.toLowerCase();
+    } catch {
+        return normalizeUrl(String(url || '').trim()).toLowerCase();
+    }
+}
+
+function buildSocialLeadKey(platform, socialLink, username = '') {
+    const normalizedPlatform = String(platform || '').trim().toLowerCase();
+    const normalizedUsername = String(username || '').trim().toLowerCase();
+
+    if (normalizedPlatform === 'instagram' && normalizedUsername) {
+        return `${normalizedPlatform}:${normalizedUsername}`;
+    }
+
+    return `${normalizedPlatform}:${normalizeSocialLink(socialLink)}`;
+}
+
+function parseCsvLine(line) {
+    const values = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+
+        if (char === '"') {
+            if (inQuotes && line[i + 1] === '"') {
+                current += '"';
+                i++;
+            } else {
+                inQuotes = !inQuotes;
+            }
+            continue;
+        }
+
+        if (char === ',' && !inQuotes) {
+            values.push(current);
+            current = '';
+            continue;
+        }
+
+        current += char;
+    }
+
+    values.push(current);
+    return values;
 }
 
 function normalizeStatus(status) {
@@ -351,6 +452,154 @@ export function setDomainVariable(domain, variable) {
         variable: normalizedVariable
     };
 }
+
+export function saveSocialLead(lead) {
+    const domain = normalizeDomain(lead?.domain);
+    const platform = String(lead?.platform || '').trim().toLowerCase();
+    const sourceUrl = normalizeUrl(String(lead?.sourceUrl || '').trim());
+    const socialLink = String(lead?.socialLink || '').trim();
+    const username = String(lead?.username || '').trim();
+    const category = String(lead?.category || '').trim() || 'link';
+    const domainVariable = String(lead?.domainVariable || '').trim();
+    const discoveredAt = String(lead?.discoveredAt || '').trim() || new Date().toISOString();
+    const updatedAt = String(lead?.updatedAt || '').trim() || discoveredAt;
+
+    if (!domain || !platform || !sourceUrl || !socialLink) {
+        return;
+    }
+
+    const leadKey = buildSocialLeadKey(platform, socialLink, username);
+
+    try {
+        upsertSocialLeadStmt.run(
+            domain,
+            platform,
+            leadKey,
+            sourceUrl,
+            socialLink,
+            username,
+            category,
+            domainVariable,
+            discoveredAt,
+            updatedAt
+        );
+    } catch (err) {
+        console.error(`Database Error (Social Lead): ${err.message}`);
+    }
+}
+
+function migrateSocialLeadsFromCsv() {
+    const resultDir = path.join(process.cwd(), 'result');
+    if (!fs.existsSync(resultDir)) {
+        return;
+    }
+
+    let processedRows = 0;
+
+    const importAllResultsFile = (filePath) => {
+        if (!fs.existsSync(filePath)) return;
+
+        const content = fs.readFileSync(filePath, 'utf8');
+        if (!content.trim()) return;
+
+        const lines = content.split('\n').filter(line => line.trim());
+        if (lines.length < 2) return;
+
+        const header = parseCsvLine(lines[0]);
+        const domainIndex = header.indexOf('Domain');
+        const platformIndex = header.indexOf('Platform');
+        const sourceUrlIndex = header.indexOf('Source URL');
+        const socialLinkIndex = header.indexOf('Social Link');
+        const usernameIndex = header.indexOf('Username');
+        const categoryIndex = header.indexOf('Category');
+        const domainVariableIndex = header.indexOf('Domain Variable');
+        const timestampIndex = header.indexOf('Timestamp');
+
+        if (domainIndex === -1 || platformIndex === -1 || sourceUrlIndex === -1 || socialLinkIndex === -1) {
+            return;
+        }
+
+        for (let i = 1; i < lines.length; i++) {
+            const values = parseCsvLine(lines[i]);
+            saveSocialLead({
+                domain: values[domainIndex],
+                platform: values[platformIndex],
+                sourceUrl: values[sourceUrlIndex],
+                socialLink: values[socialLinkIndex],
+                username: usernameIndex >= 0 ? values[usernameIndex] : '',
+                category: categoryIndex >= 0 ? values[categoryIndex] : 'link',
+                domainVariable: domainVariableIndex >= 0 ? values[domainVariableIndex] : '',
+                discoveredAt: timestampIndex >= 0 ? values[timestampIndex] : '',
+                updatedAt: timestampIndex >= 0 ? values[timestampIndex] : ''
+            });
+            processedRows++;
+        }
+    };
+
+    const importDomainFolderFiles = () => {
+        const entries = fs.readdirSync(resultDir, { withFileTypes: true })
+            .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'));
+
+        entries.forEach(entry => {
+            const domain = normalizeDomain(entry.name);
+            if (!domain) return;
+
+            const domainDir = path.join(resultDir, entry.name);
+            fs.readdirSync(domainDir, { withFileTypes: true })
+                .filter(fileEntry => fileEntry.isFile() && fileEntry.name.toLowerCase().endsWith('.csv'))
+                .forEach(fileEntry => {
+                    const filePath = path.join(domainDir, fileEntry.name);
+                    const content = fs.readFileSync(filePath, 'utf8');
+                    if (!content.trim()) return;
+
+                    const lines = content.split('\n').filter(line => line.trim());
+                    if (lines.length < 2) return;
+
+                    const header = parseCsvLine(lines[0]);
+                    const sourceUrlIndex = header.indexOf('Source URL');
+                    const socialLinkIndex = header.indexOf('Social Link');
+                    const usernameIndex = header.indexOf('Username');
+                    const categoryIndex = header.indexOf('Category');
+                    const domainVariableIndex = header.indexOf('Domain Variable');
+                    const timestampIndex = header.indexOf('Timestamp');
+                    const platform = path.basename(fileEntry.name, '.csv').toLowerCase();
+
+                    if (sourceUrlIndex === -1 || socialLinkIndex === -1 || !platform) {
+                        return;
+                    }
+
+                    for (let i = 1; i < lines.length; i++) {
+                        const values = parseCsvLine(lines[i]);
+                        saveSocialLead({
+                            domain,
+                            platform,
+                            sourceUrl: values[sourceUrlIndex],
+                            socialLink: values[socialLinkIndex],
+                            username: usernameIndex >= 0 ? values[usernameIndex] : '',
+                            category: categoryIndex >= 0 ? values[categoryIndex] : 'link',
+                            domainVariable: domainVariableIndex >= 0 ? values[domainVariableIndex] : '',
+                            discoveredAt: timestampIndex >= 0 ? values[timestampIndex] : '',
+                            updatedAt: timestampIndex >= 0 ? values[timestampIndex] : ''
+                        });
+                        processedRows++;
+                    }
+                });
+        });
+    };
+
+    try {
+        importAllResultsFile(path.join(resultDir, 'all_results.csv'));
+        importDomainFolderFiles();
+
+        if (processedRows > 0) {
+            console.log(`🔄 Synced ${processedRows} social lead row(s) from CSV into SQLite`);
+        }
+    } catch (err) {
+        console.error(`Database Error (Social Lead CSV Migration): ${err.message}`);
+    }
+}
+
+migrateSocialLeadsFromCsv();
 
 export function getPageTrackerLastSummary() {
     const raw = getSettingValue('page_tracker_last_summary', '');
