@@ -5,13 +5,14 @@ import path from 'path';
 import readlineSync from 'readline-sync';
 import zlib from 'zlib';
 import { promisify } from 'util';
-import { urlExists, getHistoryCount, saveDiscoveredSitemap, getAllSitemaps, updateSitemapScanDate } from './db.js';
+import { urlExists, getHistoryCount, normalizeUrl, getAllScrapedUrls, saveDiscoveredSitemap, getAllSitemaps, updateSitemapScanDate } from './db.js';
 
 const gunzip = promisify(zlib.gunzip);
 
 // Configuration
 const TIMEOUT = 30000; // 30 seconds
 const CONCURRENCY = 5; // Parallel sitemap fetching
+const ROOT_SITEMAP_CONCURRENCY = 3; // Parallel root sitemap processing
 
 // Extensions to ignore (images, assets)
 const IGNORED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.pdf', '.css', '.js', '.json'];
@@ -135,10 +136,7 @@ async function scrapeSitemapRecursive(url, visited = new Set(), articleUrls = ne
  * Loads the set of already scraped URLs from the database.
  */
 function loadProcessedUrls() {
-    // This is now redundant for filtering but kept for the final stats count if needed,
-    // though we check DB one by one for exactness. 
-    // We can just return an empty set and let the DB check handle it in the loop.
-    return new Set(); 
+    return new Set(getAllScrapedUrls().map(url => normalizeUrl(url)));
 }
 
 /**
@@ -239,23 +237,18 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
     
     const allNewUrls = new Set();
     const visited = new Set();
-    
-    // We process them sequentially to be safe, or we could do concurrency.
-    // Given sitemaps can be large, sequential or low concurrency is better.
-    for (let index = 0; index < sitemapsToScan.length; index++) {
-        const sitemapUrl = sitemapsToScan[index];
+    const processedUrls = loadProcessedUrls();
 
-        // Skip if already processed in this session (e.g., was a child of a previous sitemap)
+    const processRootSitemap = async (sitemapUrl) => {
         if (visited.has(sitemapUrl)) {
             summary.skippedRootSitemaps++;
             summary.elapsedMs = Date.now() - startedAt;
             await emitProgress({
                 stage: 'progress',
-                currentIndex: index + 1,
                 currentSitemapUrl: sitemapUrl,
                 summary: { ...summary, uniqueSitemapsVisited: visited.size, newUrlsFound: allNewUrls.size }
             });
-            continue;
+            return;
         }
 
         console.log(`\n🔎 Checking: ${sitemapUrl}`);
@@ -264,7 +257,6 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         summary.elapsedMs = Date.now() - startedAt;
         await emitProgress({
             stage: 'scanning',
-            currentIndex: index + 1,
             currentSitemapUrl: sitemapUrl,
             summary: { ...summary, uniqueSitemapsVisited: visited.size, newUrlsFound: allNewUrls.size }
         });
@@ -277,7 +269,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         
         // Filter new ones
         for (const url of articleUrls) {
-            if (!urlExists(url)) {
+            if (!processedUrls.has(normalizeUrl(url))) {
                 allNewUrls.add(url);
             }
         }
@@ -286,10 +278,14 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         summary.elapsedMs = Date.now() - startedAt;
         await emitProgress({
             stage: 'progress',
-            currentIndex: index + 1,
             currentSitemapUrl: sitemapUrl,
             summary: { ...summary }
         });
+    };
+
+    for (let i = 0; i < sitemapsToScan.length; i += ROOT_SITEMAP_CONCURRENCY) {
+        const chunk = sitemapsToScan.slice(i, i + ROOT_SITEMAP_CONCURRENCY);
+        await Promise.allSettled(chunk.map(processRootSitemap));
     }
 
     if (allNewUrls.size > 0) {
@@ -341,11 +337,12 @@ export async function runSitemapScraper(sitemapUrl) {
 
     let newUrlsSaved = 0;
     let filePath = null;
+    const processedUrls = loadProcessedUrls();
 
     if (articleUrls.size > 0) {
         const newUrls = [];
         for (const url of articleUrls) {
-            if (!urlExists(url)) {
+            if (!processedUrls.has(normalizeUrl(url))) {
                 newUrls.push(url);
             }
         }
@@ -419,7 +416,9 @@ export async function runBulkSitemapScraper() {
 
     console.log(`\n🚀 Found ${lines.length} entries in sitemaps.txt. Starting bulk scrape...`);
 
-    for (const line of lines) {
+    const processedUrls = loadProcessedUrls();
+
+    const processSitemapEntry = async (line) => {
         let sitemapUrl = line;
         
         // 1. Add Protocol if missing
@@ -453,7 +452,7 @@ export async function runBulkSitemapScraper() {
         if (articleUrls.size > 0) {
              const newUrls = [];
              for (const url of articleUrls) {
-                 if (!urlExists(url)) newUrls.push(url);
+                 if (!processedUrls.has(normalizeUrl(url))) newUrls.push(url);
              }
              
              if (newUrls.length > 0) {
@@ -472,6 +471,11 @@ export async function runBulkSitemapScraper() {
         } else {
             console.log(`\n⚠️  No URLs found for ${sitemapUrl}`);
         }
+    };
+
+    for (let i = 0; i < lines.length; i += ROOT_SITEMAP_CONCURRENCY) {
+        const chunk = lines.slice(i, i + ROOT_SITEMAP_CONCURRENCY);
+        await Promise.allSettled(chunk.map(processSitemapEntry));
     }
     console.log('\n✅ Bulk Sitemap Scrape Complete!');
 }

@@ -75,6 +75,7 @@ const getAllSitemapsStmt = db.prepare('SELECT url FROM discovered_sitemaps');
 const updateSitemapDateStmt = db.prepare('UPDATE discovered_sitemaps SET last_scanned = ? WHERE url = ?');
 
 const checkStmt = db.prepare('SELECT 1 FROM scraped_urls WHERE url = ?');
+const getAllScrapedUrlsStmt = db.prepare('SELECT url FROM scraped_urls');
 const getCountStmt = db.prepare('SELECT COUNT(*) as count FROM scraped_urls');
 const getSitemapCountStmt = db.prepare('SELECT COUNT(*) as count FROM discovered_sitemaps');
 const insertTrackedPageStmt = db.prepare(`
@@ -262,6 +263,10 @@ export function logScrapeResult(url, status, message, profileCount = 0) {
  */
 export function getHistoryCount() {
     return getCountStmt.get().count;
+}
+
+export function getAllScrapedUrls() {
+    return getAllScrapedUrlsStmt.all().map(row => row.url);
 }
 
 /**
