@@ -604,8 +604,6 @@ function migrateSocialLeadsFromCsv() {
     }
 }
 
-migrateSocialLeadsFromCsv();
-
 export function getPageTrackerLastSummary() {
     const raw = getSettingValue('page_tracker_last_summary', '');
     if (!raw) return null;
