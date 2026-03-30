@@ -434,7 +434,7 @@ export async function runBulkSitemapScraper() {
             }
         } catch (e) {
             console.log(`❌ Invalid URL/Domain: ${line}`);
-            continue;
+            return;
         }
 
         console.log(`\n========================================`);
