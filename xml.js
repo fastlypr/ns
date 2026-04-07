@@ -5,7 +5,7 @@ import path from 'path';
 import readlineSync from 'readline-sync';
 import zlib from 'zlib';
 import { promisify } from 'util';
-import { urlExists, getHistoryCount, normalizeUrl, getAllScrapedUrls, saveDiscoveredSitemap, getAllSitemaps, updateSitemapScanDate } from './db.js';
+import { normalizeUrl, getAllScrapedUrls, getAllQueuedUrls, saveQueuedUrls, saveDiscoveredSitemap, getAllSitemaps, updateSitemapScanDate } from './db.js';
 
 const gunzip = promisify(zlib.gunzip);
 
@@ -139,6 +139,35 @@ function loadProcessedUrls() {
     return new Set(getAllScrapedUrls().map(url => normalizeUrl(url)));
 }
 
+function loadQueuedUrls() {
+    const knownQueuedUrls = new Set(getAllQueuedUrls().map(url => normalizeUrl(url)));
+    const toScrapeDir = path.join(process.cwd(), 'to scrape');
+
+    if (!fs.existsSync(toScrapeDir)) {
+        return knownQueuedUrls;
+    }
+
+    try {
+        const files = fs.readdirSync(toScrapeDir).filter(file => file.endsWith('.txt') || file.endsWith('.csv'));
+        for (const file of files) {
+            const filePath = path.join(toScrapeDir, file);
+            const content = fs.readFileSync(filePath, 'utf8');
+            const matches = content.match(/https?:\/\/[^\s"'<>`]+/g) || [];
+
+            matches.forEach(match => {
+                const cleaned = String(match).trim().replace(/[)\].,;:!?]+$/g, '');
+                if (cleaned) {
+                    knownQueuedUrls.add(normalizeUrl(cleaned));
+                }
+            });
+        }
+    } catch (error) {
+        console.error(`⚠️  Failed to load queued URLs from to scrape: ${error.message}`);
+    }
+
+    return knownQueuedUrls;
+}
+
 /**
  * Rescans all saved sitemaps for new URLs.
  */
@@ -238,6 +267,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
     const allNewUrls = new Set();
     const visited = new Set();
     const processedUrls = loadProcessedUrls();
+    const queuedUrls = loadQueuedUrls();
 
     const processRootSitemap = async (sitemapUrl) => {
         if (visited.has(sitemapUrl)) {
@@ -269,7 +299,8 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         
         // Filter new ones
         for (const url of articleUrls) {
-            if (!processedUrls.has(normalizeUrl(url))) {
+            const normalizedUrl = normalizeUrl(url);
+            if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl)) {
                 allNewUrls.add(url);
             }
         }
@@ -298,6 +329,7 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         const filePath = path.join(toScrapeDir, filename);
 
         fs.writeFileSync(filePath, Array.from(allNewUrls).join('\n'));
+        saveQueuedUrls(Array.from(allNewUrls), `xml_rescan:${summary.target}`);
         console.log(`\n� Saved new URLs to: to scrape/${filename}`);
         summary.newUrlsSaved = allNewUrls.size;
         summary.filePath = filePath;
@@ -338,11 +370,13 @@ export async function runSitemapScraper(sitemapUrl) {
     let newUrlsSaved = 0;
     let filePath = null;
     const processedUrls = loadProcessedUrls();
+    const queuedUrls = loadQueuedUrls();
 
     if (articleUrls.size > 0) {
         const newUrls = [];
         for (const url of articleUrls) {
-            if (!processedUrls.has(normalizeUrl(url))) {
+            const normalizedUrl = normalizeUrl(url);
+            if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl)) {
                 newUrls.push(url);
             }
         }
@@ -361,6 +395,7 @@ export async function runSitemapScraper(sitemapUrl) {
             filePath = path.join(toScrapeDir, filename);
 
             fs.writeFileSync(filePath, newUrls.join('\n'));
+            saveQueuedUrls(newUrls, `xml_single:${domain}`);
             newUrlsSaved = newUrls.length;
             console.log(`\n💾 Saved ${newUrlsSaved} NEW URLs to: to scrape/${filename}`);
             console.log(`   (You can now use Option 3 in the main scraper to process this file)`);
@@ -417,6 +452,7 @@ export async function runBulkSitemapScraper() {
     console.log(`\n🚀 Found ${lines.length} entries in sitemaps.txt. Starting bulk scrape...`);
 
     const processedUrls = loadProcessedUrls();
+    const queuedUrls = loadQueuedUrls();
 
     const processSitemapEntry = async (line) => {
         let sitemapUrl = line;
@@ -452,7 +488,8 @@ export async function runBulkSitemapScraper() {
         if (articleUrls.size > 0) {
              const newUrls = [];
              for (const url of articleUrls) {
-                 if (!processedUrls.has(normalizeUrl(url))) newUrls.push(url);
+                 const normalizedUrl = normalizeUrl(url);
+                 if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl)) newUrls.push(url);
              }
              
              if (newUrls.length > 0) {
@@ -464,6 +501,7 @@ export async function runBulkSitemapScraper() {
                 const filePath = path.join(toScrapeDir, filename);
 
                 fs.writeFileSync(filePath, newUrls.join('\n'));
+                saveQueuedUrls(newUrls, `xml_bulk:${domain}`);
                 console.log(`\n💾 Saved ${newUrls.length} NEW URLs to: to scrape/${filename}`);
              } else {
                  console.log(`\n✅ All found URLs are duplicates.`);

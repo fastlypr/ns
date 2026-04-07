@@ -41,6 +41,13 @@ db.exec(`
         variable TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS queued_urls (
+        url TEXT PRIMARY KEY,
+        source TEXT,
+        discovered_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_queued_urls_updated_at ON queued_urls(updated_at);
     CREATE TABLE IF NOT EXISTS social_leads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         domain TEXT NOT NULL,
@@ -76,6 +83,15 @@ const updateSitemapDateStmt = db.prepare('UPDATE discovered_sitemaps SET last_sc
 
 const checkStmt = db.prepare('SELECT 1 FROM scraped_urls WHERE url = ?');
 const getAllScrapedUrlsStmt = db.prepare('SELECT url FROM scraped_urls');
+const getAllQueuedUrlsStmt = db.prepare('SELECT url FROM queued_urls');
+const deleteQueuedUrlStmt = db.prepare('DELETE FROM queued_urls WHERE url = ?');
+const upsertQueuedUrlStmt = db.prepare(`
+    INSERT INTO queued_urls (url, source, discovered_at, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(url) DO UPDATE SET
+        source = excluded.source,
+        updated_at = excluded.updated_at
+`);
 const getCountStmt = db.prepare('SELECT COUNT(*) as count FROM scraped_urls');
 const getSitemapCountStmt = db.prepare('SELECT COUNT(*) as count FROM discovered_sitemaps');
 const insertTrackedPageStmt = db.prepare(`
@@ -267,6 +283,49 @@ export function getHistoryCount() {
 
 export function getAllScrapedUrls() {
     return getAllScrapedUrlsStmt.all().map(row => row.url);
+}
+
+export function getAllQueuedUrls() {
+    return getAllQueuedUrlsStmt.all().map(row => row.url);
+}
+
+export function saveQueuedUrls(urls, source = 'unknown') {
+    const normalizedSource = String(source || 'unknown').trim();
+    const now = new Date().toISOString();
+    const uniqueUrls = Array.from(new Set(
+        (Array.isArray(urls) ? urls : [])
+            .map(url => normalizeUrl(String(url || '').trim()))
+            .filter(Boolean)
+    ));
+
+    if (uniqueUrls.length === 0) {
+        return 0;
+    }
+
+    const tx = db.transaction((rows) => {
+        for (const url of rows) {
+            upsertQueuedUrlStmt.run(url, normalizedSource, now, now);
+        }
+    });
+
+    try {
+        tx(uniqueUrls);
+        return uniqueUrls.length;
+    } catch (err) {
+        console.error(`Database Error (Queued URLs): ${err.message}`);
+        return 0;
+    }
+}
+
+export function removeQueuedUrl(url) {
+    const normalized = normalizeUrl(String(url || '').trim());
+    if (!normalized) return;
+
+    try {
+        deleteQueuedUrlStmt.run(normalized);
+    } catch (err) {
+        console.error(`Database Error (Remove Queued URL): ${err.message}`);
+    }
 }
 
 /**

@@ -5,7 +5,7 @@ import readlineSync from 'readline-sync';
 import fs from 'fs';
 import path from 'path';
 import { runSitemapScraper, rescanSavedSitemaps, runBulkSitemapScraper, runSitemapScraperCLI } from './xml.js';
-import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus, getDomainVariable, saveSocialLead } from './db.js';
+import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus, getDomainVariable, saveSocialLead, removeQueuedUrl } from './db.js';
 
 // Configuration
 const TIMEOUT = 15000; // 15 seconds
@@ -963,6 +963,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
             if (sourceFilePath) {
                 removeLineFromFile(sourceFilePath, rawUrl);
             }
+            removeQueuedUrl(url);
             progress.processedUrls++;
             progress.skippedCount++;
             await emitProgress('progress', { currentUrl: url, lastStatus: 'Skipped' });
@@ -975,6 +976,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
         if (sourceFilePath) {
             removeLineFromFile(sourceFilePath, rawUrl);
         }
+        removeQueuedUrl(url);
         
         if (result.error) {
             logScrapeResult(url, 'Failed', result.error);
