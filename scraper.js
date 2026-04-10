@@ -459,6 +459,60 @@ const SOCIAL_PATTERNS = {
     github: /https?:\/\/(www\.)?github\.com\/[a-zA-Z0-9_-]+/i
 };
 
+const SOCIAL_HOSTS = [
+    'instagram.com',
+    'linkedin.com',
+    'twitter.com',
+    'x.com',
+    'facebook.com',
+    'youtube.com',
+    'youtu.be',
+    'tiktok.com',
+    'pinterest.com',
+    'github.com'
+];
+
+const normalizeExtractedLink = (inputUrl) => {
+    try {
+        const parsed = new URL(inputUrl);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            return '';
+        }
+
+        parsed.hash = '';
+        parsed.search = '';
+        parsed.username = '';
+        parsed.password = '';
+
+        let normalized = parsed.toString();
+        if (normalized.endsWith('/') && parsed.pathname !== '/') {
+            normalized = normalized.slice(0, -1);
+        }
+
+        return normalized;
+    } catch {
+        return '';
+    }
+};
+
+const isWebsiteLeadUrl = (candidateUrl, sourceUrl) => {
+    try {
+        const parsed = new URL(candidateUrl);
+        const source = new URL(sourceUrl);
+        const candidateHost = parsed.hostname.toLowerCase().replace(/^www\./, '');
+        const sourceHost = source.hostname.toLowerCase().replace(/^www\./, '');
+        const lowerPath = parsed.pathname.toLowerCase();
+
+        if (candidateHost === sourceHost) return false;
+        if (SOCIAL_HOSTS.some(host => candidateHost === host || candidateHost.endsWith(`.${host}`))) return false;
+        if (ARTICLE_URL_IGNORED_EXTENSIONS.some(ext => lowerPath.endsWith(ext))) return false;
+
+        return true;
+    } catch {
+        return false;
+    }
+};
+
 /**
  * Scrapes a single article URL for social media links.
  * @param {string} url - The URL of the article to scrape.
@@ -521,17 +575,21 @@ async function scrapeSocialLinks(url) {
                     return;
                 }
 
-                // Check against all patterns
+                let fullUrl = '';
+                try {
+                    fullUrl = href.startsWith('http') ? href : new URL(href, url).href;
+                } catch (e) {
+                    return;
+                }
+
+                let matchedSocial = false;
+
                 for (const [platform, regex] of Object.entries(SOCIAL_PATTERNS)) {
-                    if (regex.test(href)) {
+                    if (regex.test(fullUrl)) {
                         try {
-                            const fullUrl = href.startsWith('http') ? href : new URL(href, url).href;
-                            const cleanUrlObj = new URL(fullUrl);
-                            const cleanHref = cleanUrlObj.origin + cleanUrlObj.pathname;
-                            
-                            // Normalize if Instagram, otherwise use cleanHref
-                            const normalizedHref = cleanHref;
-                            
+                            const normalizedHref = normalizeExtractedLink(fullUrl);
+                            if (!normalizedHref) return;
+
                             if (!uniqueLinks.has(normalizedHref)) {
                                 uniqueLinks.add(normalizedHref);
                                 socials.push({
@@ -540,9 +598,22 @@ async function scrapeSocialLinks(url) {
                                     category: 'link'
                                 });
                             }
+                            matchedSocial = true;
                         } catch (e) {
                             // skip invalid urls
                         }
+                    }
+                }
+
+                if (!matchedSocial && isWebsiteLeadUrl(fullUrl, url)) {
+                    const normalizedWebsiteUrl = normalizeExtractedLink(fullUrl);
+                    if (normalizedWebsiteUrl && !uniqueLinks.has(normalizedWebsiteUrl)) {
+                        uniqueLinks.add(normalizedWebsiteUrl);
+                        socials.push({
+                            platform: 'website',
+                            link: normalizedWebsiteUrl,
+                            category: 'website'
+                        });
                     }
                 }
             });
@@ -1009,7 +1080,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
             progress.linkedinLeadKeys = Array.from(linkedinLeadSet);
             progress.instagramLeadKeys = Array.from(instagramLeadSet);
             logScrapeResult(url, 'Success', `Found ${result.socials.length} links`);
-            console.log(`✅ Found ${result.socials.length} social media links:`);
+            console.log(`✅ Found ${result.socials.length} links:`);
             result.socials.forEach(item => {
                 console.log(`   - [${item.platform.toUpperCase()}] ${item.link}`);
             });
@@ -1020,8 +1091,8 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
             progress.successCount++;
             await emitProgress('progress', { currentUrl: url, lastStatus: 'Success' });
         } else {
-            logScrapeResult(url, 'No_Result', 'No social links found');
-            console.log('⚠️  No social media links found (Marked as No Result).');
+            logScrapeResult(url, 'No_Result', 'No links found');
+            console.log('⚠️  No links found (Marked as No Result).');
             progress.processedUrls++;
             progress.noResultCount++;
             await emitProgress('progress', { currentUrl: url, lastStatus: 'No_Result' });
