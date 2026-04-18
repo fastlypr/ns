@@ -156,7 +156,29 @@ const upsertSettingStmt = db.prepare('INSERT OR REPLACE INTO app_settings (key, 
  */
 export function normalizeUrl(url) {
     if (!url) return '';
-    return url.replace(/\/$/, '');
+
+    const raw = String(url).trim();
+
+    try {
+        const parsed = new URL(raw);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            return raw.replace(/\/$/, '');
+        }
+
+        parsed.hash = '';
+        parsed.search = '';
+        parsed.username = '';
+        parsed.password = '';
+
+        let normalized = parsed.toString();
+        if (normalized.endsWith('/') && parsed.pathname !== '/') {
+            normalized = normalized.slice(0, -1);
+        }
+
+        return normalized;
+    } catch {
+        return raw.replace(/\/$/, '');
+    }
 }
 
 function normalizeDomain(domain) {

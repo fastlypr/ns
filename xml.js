@@ -16,6 +16,61 @@ const ROOT_SITEMAP_CONCURRENCY = 3; // Parallel root sitemap processing
 
 // Extensions to ignore (images, assets)
 const IGNORED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.pdf', '.css', '.js', '.json'];
+const NON_ARTICLE_SEGMENTS = new Set([
+    'about',
+    'account',
+    'author',
+    'authors',
+    'category',
+    'categories',
+    'contact',
+    'feed',
+    'home',
+    'index',
+    'login',
+    'page',
+    'privacy',
+    'privacy-policy',
+    'search',
+    'signup',
+    'tag',
+    'tags',
+    'terms',
+    'topic',
+    'topics',
+    'wp-json'
+]);
+
+function scoreSitemapCandidateUrl(urlStr) {
+    try {
+        const parsed = new URL(urlStr);
+        const lowerHost = parsed.hostname.toLowerCase();
+        const lowerPath = parsed.pathname.toLowerCase();
+        const segments = lowerPath.split('/').filter(Boolean);
+
+        if (IGNORED_EXTENSIONS.some(ext => lowerPath.endsWith(ext))) return -10;
+        if (lowerHost.startsWith('miro.') || lowerHost.startsWith('cdn.') || lowerHost.startsWith('images.')) return -10;
+        if (segments.length === 0) return -10;
+        if (segments.some(segment => NON_ARTICLE_SEGMENTS.has(segment))) return -6;
+
+        const lastSegment = segments[segments.length - 1] || '';
+        let score = 0;
+
+        if (segments.length >= 2) score += 2;
+        if (lastSegment.includes('-')) score += 2;
+        if (lastSegment.length >= 16) score += 1;
+        if (/\d{4}/.test(lowerPath)) score += 1;
+        if (/[a-f0-9]{8,}/.test(lastSegment)) score += 1;
+
+        return score;
+    } catch {
+        return -10;
+    }
+}
+
+function isLikelyArticleUrl(urlStr) {
+    return scoreSitemapCandidateUrl(urlStr) >= 2;
+}
 
 /**
  * Fetches a URL and returns its body (handling gzip if necessary).
@@ -300,8 +355,12 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         // Filter new ones
         for (const url of articleUrls) {
             const normalizedUrl = normalizeUrl(url);
-            if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl)) {
-                allNewUrls.add(url);
+            if (!normalizedUrl || !isLikelyArticleUrl(normalizedUrl)) {
+                continue;
+            }
+
+            if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl) && !allNewUrls.has(normalizedUrl)) {
+                allNewUrls.add(normalizedUrl);
             }
         }
 
@@ -328,8 +387,9 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         const filename = `rescan_updates_${Date.now()}.txt`;
         const filePath = path.join(toScrapeDir, filename);
 
-        fs.writeFileSync(filePath, Array.from(allNewUrls).join('\n'));
-        saveQueuedUrls(Array.from(allNewUrls), `xml_rescan:${summary.target}`);
+        const newUrlsToSave = Array.from(allNewUrls);
+        fs.writeFileSync(filePath, newUrlsToSave.join('\n'));
+        saveQueuedUrls(newUrlsToSave, `xml_rescan:${summary.target}`);
         console.log(`\n� Saved new URLs to: to scrape/${filename}`);
         summary.newUrlsSaved = allNewUrls.size;
         summary.filePath = filePath;
@@ -376,8 +436,12 @@ export async function runSitemapScraper(sitemapUrl) {
         const newUrls = [];
         for (const url of articleUrls) {
             const normalizedUrl = normalizeUrl(url);
-            if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl)) {
-                newUrls.push(url);
+            if (!normalizedUrl || !isLikelyArticleUrl(normalizedUrl)) {
+                continue;
+            }
+
+            if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl) && !newUrls.includes(normalizedUrl)) {
+                newUrls.push(normalizedUrl);
             }
         }
 
@@ -489,7 +553,10 @@ export async function runBulkSitemapScraper() {
              const newUrls = [];
              for (const url of articleUrls) {
                  const normalizedUrl = normalizeUrl(url);
-                 if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl)) newUrls.push(url);
+                 if (!normalizedUrl || !isLikelyArticleUrl(normalizedUrl)) continue;
+                 if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl) && !newUrls.includes(normalizedUrl)) {
+                    newUrls.push(normalizedUrl);
+                 }
              }
              
              if (newUrls.length > 0) {
