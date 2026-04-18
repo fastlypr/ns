@@ -134,13 +134,51 @@ const getSettingStmt = db.prepare('SELECT value FROM app_settings WHERE key = ?'
 const upsertSettingStmt = db.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)');
 
 /**
- * Normalizes a URL by removing the trailing slash.
- * @param {string} url 
+ * Normalizes a URL into a canonical form used as the DB primary key.
+ * Handles: http/https, www vs non-www, hostname case, fragments, trailing slashes.
+ * Query strings are preserved (they often distinguish articles, e.g. ?p=123).
+ * Path case is preserved (most web servers treat paths as case-sensitive).
+ * Falls back to the legacy behavior (trailing-slash strip) if URL parsing fails.
+ * @param {string} url
  * @returns {string}
  */
 export function normalizeUrl(url) {
     if (!url) return '';
-    return url.replace(/\/$/, '');
+    const raw = String(url).trim();
+    if (!raw) return '';
+
+    try {
+        const parsed = new URL(raw);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            // Non-http(s) schemes (ftp:, file:, mailto:, etc.) — keep as-is, just trim trailing slash
+            return raw.replace(/\/$/, '');
+        }
+
+        // Normalize scheme to https for dedup (same article whether served over http or https)
+        parsed.protocol = 'https:';
+        // Lowercase hostname + strip leading www. (canonical host form)
+        parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+        // Drop fragment (client-side only, same page)
+        parsed.hash = '';
+        // Strip any embedded credentials
+        parsed.username = '';
+        parsed.password = '';
+        // Drop default ports
+        if ((parsed.protocol === 'https:' && parsed.port === '443') ||
+            (parsed.protocol === 'http:' && parsed.port === '80')) {
+            parsed.port = '';
+        }
+
+        let normalized = parsed.toString();
+        // Strip trailing slash unless the path is just "/"
+        if (normalized.endsWith('/') && parsed.pathname !== '/') {
+            normalized = normalized.slice(0, -1);
+        }
+        return normalized;
+    } catch {
+        // Malformed URL — preserve legacy behavior so we don't silently drop entries
+        return raw.replace(/\/$/, '');
+    }
 }
 
 function normalizeDomain(domain) {
