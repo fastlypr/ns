@@ -980,7 +980,7 @@ function removeLineFromFile(filePath, urlToRemove) {
  */
 export async function runScraper(urls, sourceFilePath = null, force = false, options = {}) {
     ensureScraperInitialized();
-    const { onProgress } = options;
+    const { onProgress, signal } = options;
     const startedAt = Date.now();
     const linkedinLeadSet = new Set();
     const instagramLeadSet = new Set();
@@ -1103,9 +1103,11 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
     let currentIndex = 0;
     const activeWorkers = [];
 
-    // Worker loop
+    // Worker loop — honors the abort signal so /stop in the Telegram bot
+    // (or any other caller) can cancel at a URL boundary cleanly.
     const worker = async () => {
         while (currentIndex < urls.length) {
+            if (signal?.aborted) return;
             const url = urls[currentIndex++];
             if (url) await processUrl(url);
         }
@@ -1165,7 +1167,7 @@ export async function scrapeUrlsFromInputFile(filePath, options = {}) {
  * @param {string} toScrapeDir - The path to the 'to scrape' directory.
  */
 export async function processToScrapeFolder(toScrapeDir, options = {}) {
-    const { onProgress } = options;
+    const { onProgress, signal } = options;
     const emitProgress = async (payload) => {
         if (typeof onProgress === 'function') {
             await onProgress(payload);
@@ -1229,11 +1231,13 @@ export async function processToScrapeFolder(toScrapeDir, options = {}) {
         const completedInstagramLeadSet = new Set();
 
         for (const entry of fileEntries) {
+            if (signal?.aborted) break;
             summary.currentFile = entry.file;
             summary.elapsedMs = Date.now() - startedAt;
             await emitProgress({ stage: 'file_start', summary: { ...summary } });
 
             const fileSummary = await runScraper(entry.urls, entry.filePath, false, {
+                signal,
                 onProgress: async (progress) => {
                     summary.currentFile = entry.file;
                     summary.processedUrls = completedUrls + (progress.processedUrls || 0);

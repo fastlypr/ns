@@ -895,6 +895,7 @@ const runSitemapRescanFlow = async (chatId, targetDomain) => {
 const BOT_COMMANDS = [
     { command: 'help', description: 'Show available commands' },
     { command: 'status', description: 'Get current bot status' },
+    { command: 'stop', description: 'Stop the currently running task' },
     { command: 'scrape_url', description: 'Scrape a single URL' },
     { command: 'scrape_file', description: 'Scrape URLs from a file in "to scrape" folder' },
     { command: 'scrape_folder', description: 'Process all files in "to scrape" folder' },
@@ -925,6 +926,7 @@ const buildHelpMessage = () => [
     '',
     '📊 *Results*',
     formatHelpLine('📡', '/status', '- Show current bot status'),
+    formatHelpLine('🛑', '/stop', '- Stop the currently running task'),
     formatHelpLine('📈', '/stats', '- Show scraping statistics'),
     formatHelpLine('📂', '/download_results', '- Browse and download result CSV files'),
     formatHelpLine('📤', '/export_urls <status>', '- Export URLs by status'),
@@ -1344,6 +1346,9 @@ bot.setMyCommands(BOT_COMMANDS).catch(error => {
 // Store bot status (e.g., 'idle', 'scraping', 'sitemap_bulk')
 let botStatus = 'idle';
 let currentTask = null;
+// AbortController for the currently-running foreground task (scrape, sitemap, etc.)
+// /stop triggers .abort() on this; scraper worker loops check signal.aborted at URL boundaries.
+let currentAbortController = null;
 let auxiliaryTaskCounter = 0;
 const auxiliaryTasks = new Map();
 const AUXILIARY_TASK_RETENTION_MS = 5 * 60 * 1000;
@@ -1672,6 +1677,7 @@ const runTrackedFileScrape = async (chatId, filePath) => {
     };
 
     const summary = await scrapeUrlsFromInputFile(filePath, {
+        signal: getCurrentAbortSignal(),
         onProgress: async (progress) => {
             await updateTracker(progress, progress.stage === 'start' || progress.stage === 'complete');
         }
@@ -1683,7 +1689,10 @@ const runTrackedFileScrape = async (chatId, filePath) => {
     }
 
     await updateTracker(summary, true);
-    await sendPlainMessage(buildFileScrapeSummaryText(fileName, summary), chatId);
+    const wasStopped = getCurrentAbortSignal()?.aborted;
+    const summaryHeader = wasStopped ? '🛑 Scrape Stopped by /stop' : null;
+    const summaryText = buildFileScrapeSummaryText(fileName, summary);
+    await sendPlainMessage(summaryHeader ? `${summaryHeader}\n${summaryText}` : summaryText, chatId);
 };
 
 const runTrackedFolderScrape = async (chatId, toScrapeDir) => {
@@ -1721,6 +1730,7 @@ const runTrackedFolderScrape = async (chatId, toScrapeDir) => {
     };
 
     const summary = await processToScrapeFolder(toScrapeDir, {
+        signal: getCurrentAbortSignal(),
         onProgress: async ({ stage, summary: progressSummary }) => {
             await updateTracker(progressSummary, stage === 'start' || stage === 'complete');
         }
@@ -1732,7 +1742,10 @@ const runTrackedFolderScrape = async (chatId, toScrapeDir) => {
     }
 
     await updateTracker(summary, true);
-    await sendPlainMessage(buildFolderScrapeSummaryText(summary), chatId);
+    const wasStopped = getCurrentAbortSignal()?.aborted;
+    const summaryHeader = wasStopped ? '🛑 Folder Scrape Stopped by /stop' : null;
+    const summaryText = buildFolderScrapeSummaryText(summary);
+    await sendPlainMessage(summaryHeader ? `${summaryHeader}\n${summaryText}` : summaryText, chatId);
 };
 
 const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
@@ -1768,6 +1781,7 @@ const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
     };
 
     const summary = await runScraper(urls, null, force, {
+        signal: getCurrentAbortSignal(),
         onProgress: async (progress) => {
             await updateTracker(progress, progress.stage === 'start' || progress.stage === 'complete');
         }
@@ -1779,7 +1793,10 @@ const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
     }
 
     await updateTracker(summary, true);
-    await sendPlainMessage(buildFileScrapeSummaryText(label, summary), chatId);
+    const wasStopped = getCurrentAbortSignal()?.aborted;
+    const summaryHeader = wasStopped ? '🛑 Scrape Stopped by /stop' : null;
+    const summaryText = buildFileScrapeSummaryText(label, summary);
+    await sendPlainMessage(summaryHeader ? `${summaryHeader}\n${summaryText}` : summaryText, chatId);
 };
 
 const buildRetryProgressText = (targetLabel, typeLabel, summary) => {
@@ -2143,12 +2160,20 @@ const runPageTrackerFlow = async (chatId = null, trigger = 'manual', trackedPage
 
 const withBotStatus = async (status, task, action) => {
     setBotStatus(status, task);
+    const controller = new AbortController();
+    currentAbortController = controller;
     try {
-        await action();
+        // action receives the signal so callers can pass it into scraper/sitemap runners.
+        await action(controller.signal);
     } finally {
+        if (currentAbortController === controller) {
+            currentAbortController = null;
+        }
         setBotStatus('idle', null);
     }
 };
+
+const getCurrentAbortSignal = () => currentAbortController?.signal;
 
 startPageTrackerScheduler();
 notifyDeployStatusIfPresent().catch(error => {
@@ -2178,6 +2203,31 @@ bot.onText(/\/help/, (msg) => {
         return;
     }
     bot.sendMessage(msg.chat.id, buildHelpMessage(), { parse_mode: 'MarkdownV2' });
+});
+
+bot.onText(/^\/stop$/, async (msg) => {
+    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
+    if (!isAuthorized) {
+        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
+        return;
+    }
+
+    if (!currentAbortController || currentAbortController.signal.aborted) {
+        await bot.sendMessage(
+            msg.chat.id,
+            botStatus === 'idle'
+                ? 'ℹ️ No task is currently running.'
+                : `ℹ️ Current task (${botStatus}) is already stopping.`
+        );
+        return;
+    }
+
+    const stoppedTask = currentTask || botStatus;
+    currentAbortController.abort();
+    await bot.sendMessage(
+        msg.chat.id,
+        `🛑 Stop requested. The current task (${stoppedTask}) will halt after finishing any in-flight URLs. A final summary will follow shortly.`
+    );
 });
 
 bot.onText(/\/status/, (msg) => {
