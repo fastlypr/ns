@@ -1422,9 +1422,30 @@ const safeEditMessageText = async (chatId, messageId, text) => {
         });
     } catch (error) {
         const description = error?.response?.body?.description || error?.message || '';
-        if (description.includes('message is not modified')) {
+        const statusCode = error?.response?.statusCode || error?.code;
+        const lower = description.toLowerCase();
+
+        // No-op: text didn't change
+        if (lower.includes('message is not modified')) return;
+
+        // Transient — skip this tick, the next update will re-try editing the same message.
+        // Sending a replacement message here is what caused duplicate tracker spam.
+        if (
+            statusCode === 429 ||
+            lower.includes('too many requests') ||
+            lower.includes('retry after') ||
+            lower.includes('timeout') ||
+            lower.includes('socket hang up') ||
+            lower.includes('econnreset') ||
+            lower.includes('etimedout') ||
+            lower.includes('eai_again') ||
+            lower.includes('network')
+        ) {
             return;
         }
+
+        // Only bubble up when the message truly can no longer be edited,
+        // so the caller can fall back to sending a new tracker.
         throw error;
     }
 };
