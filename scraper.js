@@ -1178,7 +1178,16 @@ export async function processToScrapeFolder(toScrapeDir, options = {}) {
                     ]).size;
                     summary.currentUrl = progress.currentUrl || '';
                     summary.elapsedMs = Date.now() - startedAt;
-                    await emitProgress({ stage: progress.stage || 'progress', summary: { ...summary } });
+                    // Do NOT leak the inner runScraper's 'start'/'complete' stages upward —
+                    // the folder-level tracker treats those as force-flush triggers, which
+                    // would produce ~2 forced Telegram edits per file (file N complete +
+                    // file N+1 start) and trip the 1-edit/sec rate limit. Outer file
+                    // lifecycle is already emitted via 'file_start' / 'file_complete' below.
+                    const innerStage = progress.stage;
+                    const outerStage = (innerStage === 'start' || innerStage === 'complete')
+                        ? 'progress'
+                        : (innerStage || 'progress');
+                    await emitProgress({ stage: outerStage, summary: { ...summary } });
                 }
             });
 
