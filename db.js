@@ -151,8 +151,8 @@ const upsertSettingStmt = db.prepare('INSERT OR REPLACE INTO app_settings (key, 
 
 /**
  * Normalizes a URL into a canonical form used as the DB primary key.
- * Handles: http/https, www vs non-www, hostname case, fragments, trailing slashes.
- * Query strings are preserved (they often distinguish articles, e.g. ?p=123).
+ * Handles: http/https, www vs non-www, hostname case, fragments, query strings,
+ * credentials, default ports, and trailing slashes.
  * Path case is preserved (most web servers treat paths as case-sensitive).
  * Falls back to the legacy behavior (trailing-slash strip) if URL parsing fails.
  * @param {string} url
