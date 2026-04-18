@@ -1568,6 +1568,7 @@ const buildFileScrapeProgressText = (fileName, summary) => {
         `✅ Success: ${summary.successCount}`,
         `❌ Failed: ${summary.failedCount}`,
         `⚠️ No Result: ${summary.noResultCount}`,
+        `⏭️ Skipped (Already Scraped): ${summary.skippedCount || 0}`,
         `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
         `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
@@ -1611,6 +1612,7 @@ const buildFolderScrapeProgressText = (summary) => {
         `✅ Success: ${summary.successCount}`,
         `❌ Failed: ${summary.failedCount}`,
         `⚠️ No Result: ${summary.noResultCount}`,
+        `⏭️ Skipped (Already Scraped): ${summary.skippedCount || 0}`,
         `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
         `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `⏱ Elapsed: ${formatElapsed(summary.elapsedMs)}`,
@@ -1629,6 +1631,7 @@ const buildFolderScrapeSummaryText = (summary) => {
         `Success: ${summary.successCount}`,
         `Failed: ${summary.failedCount}`,
         `No Result: ${summary.noResultCount}`,
+        `Skipped (Already Scraped): ${summary.skippedCount || 0}`,
         `👔 LinkedIn Leads: ${summary.linkedinLeadCount || 0}`,
         `📸 Instagram Leads: ${summary.instagramLeadCount || 0}`,
         `Elapsed: ${formatElapsed(summary.elapsedMs)}`
