@@ -44,10 +44,14 @@ db.exec(`
     CREATE TABLE IF NOT EXISTS queued_urls (
         url TEXT PRIMARY KEY,
         source TEXT,
+        batch_id TEXT,
+        status TEXT NOT NULL DEFAULT 'Queued',
         discovered_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_queued_urls_updated_at ON queued_urls(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_queued_urls_batch_status ON queued_urls(batch_id, status);
+    CREATE INDEX IF NOT EXISTS idx_queued_urls_status ON queued_urls(status);
     CREATE TABLE IF NOT EXISTS social_leads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         domain TEXT NOT NULL,
@@ -75,6 +79,21 @@ try {
     // Column likely already exists
 }
 
+// Migration: add batch_id / status columns to queued_urls if missing (older installs)
+try {
+    const qcols = db.prepare("PRAGMA table_info(queued_urls)").all();
+    if (!qcols.some(c => c.name === 'batch_id')) {
+        db.exec("ALTER TABLE queued_urls ADD COLUMN batch_id TEXT");
+    }
+    if (!qcols.some(c => c.name === 'status')) {
+        db.exec("ALTER TABLE queued_urls ADD COLUMN status TEXT NOT NULL DEFAULT 'Queued'");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_queued_urls_batch_status ON queued_urls(batch_id, status)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_queued_urls_status ON queued_urls(status)");
+} catch (e) {
+    // Columns likely already exist
+}
+
 // Prepared Statements for Speed
 const insertStmt = db.prepare('INSERT OR REPLACE INTO scraped_urls (url, status, message, timestamp, no_unique_profile) VALUES (?, ?, ?, ?, ?)');
 const insertSitemapStmt = db.prepare('INSERT OR IGNORE INTO discovered_sitemaps (url, parent_url, last_scanned) VALUES (?, ?, ?)');
@@ -86,12 +105,46 @@ const getAllScrapedUrlsStmt = db.prepare('SELECT url FROM scraped_urls');
 const getAllQueuedUrlsStmt = db.prepare('SELECT url FROM queued_urls');
 const deleteQueuedUrlStmt = db.prepare('DELETE FROM queued_urls WHERE url = ?');
 const upsertQueuedUrlStmt = db.prepare(`
-    INSERT INTO queued_urls (url, source, discovered_at, updated_at)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO queued_urls (url, source, batch_id, status, discovered_at, updated_at)
+    VALUES (?, ?, ?, 'Queued', ?, ?)
     ON CONFLICT(url) DO UPDATE SET
         source = excluded.source,
+        batch_id = COALESCE(excluded.batch_id, queued_urls.batch_id),
+        status = CASE WHEN queued_urls.status = 'Done' THEN queued_urls.status ELSE 'Queued' END,
         updated_at = excluded.updated_at
 `);
+const getQueuedByBatchStmt = db.prepare(`
+    SELECT url FROM queued_urls
+    WHERE batch_id = ? AND status = 'Queued'
+    ORDER BY discovered_at ASC
+`);
+const getQueuedAllStmt = db.prepare(`
+    SELECT url FROM queued_urls
+    WHERE status = 'Queued'
+    ORDER BY discovered_at ASC
+`);
+const setQueueStatusStmt = db.prepare(`
+    UPDATE queued_urls SET status = ?, updated_at = ? WHERE url = ?
+`);
+const listBatchesStmt = db.prepare(`
+    SELECT
+        COALESCE(batch_id, '') AS batch_id,
+        COALESCE(source, '')   AS source,
+        COUNT(*)                                          AS total,
+        SUM(CASE WHEN status = 'Queued'   THEN 1 ELSE 0 END) AS queued,
+        SUM(CASE WHEN status = 'Scraping' THEN 1 ELSE 0 END) AS scraping,
+        SUM(CASE WHEN status = 'Done'     THEN 1 ELSE 0 END) AS done,
+        SUM(CASE WHEN status = 'Failed'   THEN 1 ELSE 0 END) AS failed,
+        MIN(discovered_at)                                AS first_seen,
+        MAX(updated_at)                                   AS last_updated
+    FROM queued_urls
+    GROUP BY batch_id, source
+    ORDER BY MAX(updated_at) DESC
+`);
+const deleteBatchStmt = db.prepare('DELETE FROM queued_urls WHERE batch_id = ?');
+const deleteDoneStmt  = db.prepare("DELETE FROM queued_urls WHERE status = 'Done'");
+const countQueuedBatchStmt = db.prepare("SELECT COUNT(*) AS n FROM queued_urls WHERE batch_id = ? AND status = 'Queued'");
+const countQueuedAllStmt   = db.prepare("SELECT COUNT(*) AS n FROM queued_urls WHERE status = 'Queued'");
 const getCountStmt = db.prepare('SELECT COUNT(*) as count FROM scraped_urls');
 const getSitemapCountStmt = db.prepare('SELECT COUNT(*) as count FROM discovered_sitemaps');
 const insertTrackedPageStmt = db.prepare(`
@@ -329,8 +382,28 @@ export function getAllQueuedUrls() {
     return getAllQueuedUrlsStmt.all().map(row => row.url);
 }
 
-export function saveQueuedUrls(urls, source = 'unknown') {
-    const normalizedSource = String(source || 'unknown').trim();
+/**
+ * Build a deterministic batch id: "{source}:{identifier}:{timestamp}".
+ * Safe against collisions since timestamp is ms-precision + random suffix.
+ */
+export function makeBatchId(source = 'unknown', identifier = '') {
+    const s = String(source || 'unknown').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 40) || 'unknown';
+    const i = String(identifier || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 60);
+    const ts = Date.now();
+    const rand = Math.random().toString(36).slice(2, 6);
+    return i ? `${s}:${i}:${ts}-${rand}` : `${s}:${ts}-${rand}`;
+}
+
+/**
+ * Enqueue URLs into the work queue. Deduplicates within the input and against
+ * any existing rows (existing rows stay 'Done' if already scraped, otherwise reset to 'Queued').
+ * @param {string[]} urls
+ * @param {{ source?: string, batchId?: string }} [opts]
+ * @returns {{ inserted: number, batchId: string }}
+ */
+export function enqueueUrls(urls, { source = 'unknown', batchId = null } = {}) {
+    const normalizedSource = String(source || 'unknown').trim() || 'unknown';
+    const bid = batchId || makeBatchId(normalizedSource);
     const now = new Date().toISOString();
     const uniqueUrls = Array.from(new Set(
         (Array.isArray(urls) ? urls : [])
@@ -339,20 +412,84 @@ export function saveQueuedUrls(urls, source = 'unknown') {
     ));
 
     if (uniqueUrls.length === 0) {
-        return 0;
+        return { inserted: 0, batchId: bid };
     }
 
     const tx = db.transaction((rows) => {
         for (const url of rows) {
-            upsertQueuedUrlStmt.run(url, normalizedSource, now, now);
+            upsertQueuedUrlStmt.run(url, normalizedSource, bid, now, now);
         }
     });
 
     try {
         tx(uniqueUrls);
-        return uniqueUrls.length;
+        return { inserted: uniqueUrls.length, batchId: bid };
     } catch (err) {
-        console.error(`Database Error (Queued URLs): ${err.message}`);
+        console.error(`Database Error (Enqueue URLs): ${err.message}`);
+        return { inserted: 0, batchId: bid };
+    }
+}
+
+/** Backward-compat wrapper for older callers. */
+export function saveQueuedUrls(urls, source = 'unknown') {
+    return enqueueUrls(urls, { source }).inserted;
+}
+
+/**
+ * Returns URLs in 'Queued' status, optionally filtered by batch.
+ * @param {{ batchId?: string|null }} [opts]
+ * @returns {string[]}
+ */
+export function getQueuedUrls({ batchId = null } = {}) {
+    if (batchId) return getQueuedByBatchStmt.all(batchId).map(r => r.url);
+    return getQueuedAllStmt.all().map(r => r.url);
+}
+
+/**
+ * List distinct batches with per-status counts. Used by the bot UI.
+ */
+export function listQueueBatches() {
+    return listBatchesStmt.all();
+}
+
+/** Update a queue row's lifecycle status. */
+export function setQueueUrlStatus(url, status) {
+    const normalized = normalizeUrl(String(url || '').trim());
+    if (!normalized) return;
+    try {
+        setQueueStatusStmt.run(status, new Date().toISOString(), normalized);
+    } catch (err) {
+        console.error(`Database Error (Queue Status): ${err.message}`);
+    }
+}
+
+export const markQueueScraping = (url) => setQueueUrlStatus(url, 'Scraping');
+export const markQueueDone     = (url) => setQueueUrlStatus(url, 'Done');
+export const markQueueFailed   = (url) => setQueueUrlStatus(url, 'Failed');
+
+/** Count remaining queued urls, optionally by batch. */
+export function countQueued(batchId = null) {
+    if (batchId) return countQueuedBatchStmt.get(batchId)?.n || 0;
+    return countQueuedAllStmt.get()?.n || 0;
+}
+
+/** Delete all rows in a batch (used on cleanup / cancellation). */
+export function deleteQueueBatch(batchId) {
+    if (!batchId) return 0;
+    try {
+        return deleteBatchStmt.run(batchId).changes;
+    } catch (err) {
+        console.error(`Database Error (Delete Batch): ${err.message}`);
+        return 0;
+    }
+}
+
+/** Purge all rows that finished (status='Done'). */
+export function purgeDoneFromQueue() {
+    try {
+        return deleteDoneStmt.run().changes;
+    } catch (err) {
+        console.error(`Database Error (Purge Done): ${err.message}`);
         return 0;
     }
 }

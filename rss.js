@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import * as cheerio from 'cheerio';
 import { gotScraping } from 'got-scraping';
-import { urlExists } from './db.js';
+import { urlExists, enqueueUrls, makeBatchId } from './db.js';
 
 function isoNow() {
     return new Date().toISOString();
@@ -841,15 +841,19 @@ function slugifyName(name) {
     return String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 }
 
+/**
+ * Enqueue newly-discovered tracked-page URLs into the DB work queue.
+ * Returns a "locator" (the batch id) so callers can log where the URLs live.
+ * Kept the name `writeQueueFile` for call-site compatibility; it no longer
+ * touches the `to scrape/` directory — that path is deprecated.
+ */
 function writeQueueFile(name, urls) {
     if (!Array.isArray(urls) || urls.length === 0) return null;
-    const toScrapeDir = path.join(process.cwd(), 'to scrape');
-    safeMkdir(toScrapeDir);
-    const datePart = new Date().toISOString().slice(0, 10);
-    const filename = `page_${slugifyName(name)}_${datePart}_${Date.now()}.txt`;
-    const filePath = path.join(toScrapeDir, filename);
-    fs.writeFileSync(filePath, urls.join('\n'));
-    return filePath;
+    const slug = slugifyName(name) || 'tracked_page';
+    const batchId = makeBatchId('page', slug);
+    const { inserted } = enqueueUrls(urls, { source: `page:${slug}`, batchId });
+    if (inserted === 0) return null;
+    return batchId;
 }
 
 async function processHtmlTrackedPage(entry, configDefaults, state) {

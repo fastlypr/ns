@@ -12,6 +12,7 @@ import {
     scrapeUrlsFromInputFile,
     runScraper,
     processToScrapeFolder,
+    runScraperFromQueue,
     initializeScraper,
     extractSmartArticleUrls,
     getProxyMode,
@@ -42,7 +43,14 @@ import {
     getPageTrackerLastSummary,
     savePageTrackerLastSummary,
     getDomainVariable,
-    setDomainVariable
+    setDomainVariable,
+    enqueueUrls,
+    makeBatchId,
+    listQueueBatches,
+    countQueued,
+    deleteQueueBatch,
+    purgeDoneFromQueue,
+    getQueuedUrls
 } from './db.js';
 
 // Utility function to escape MarkdownV2 special characters
@@ -964,7 +972,36 @@ const buildArticleMenuKeyboard = () => ({
         [{ text: '📤 Upload TXT / CSV', callback_data: 'home_wait:upload_txt' }],
         [{ text: '✍️ Paste URLs', callback_data: 'home_wait:paste_urls' }],
         [{ text: '📁 Scrape Folder', callback_data: 'home_action:scrape_folder' }],
+        [{ text: '🗂 Scrape Queue', callback_data: 'home_open:queue_menu' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
+    ]
+});
+
+/**
+ * Renders the queue overview: global counts + up to 10 batches (most recent first).
+ * "Run All Queued" pulls all Queued rows regardless of batch; per-batch buttons
+ * filter to a single batch. Purge Done clears finished rows (safe — history
+ * remains in `scraped_urls`).
+ */
+const buildQueueMenuKeyboard = () => {
+    const batches = listQueueBatches().slice(0, 10);
+    const rows = [];
+    const total = countQueued();
+    rows.push([{ text: `▶️ Run All Queued (${total})`, callback_data: 'queue_run_all' }]);
+    for (const b of batches) {
+        const label = `${b.queued ? '🟡' : (b.done ? '✅' : '⬜')} ${b.batch_id || '(no batch)'} — ${b.queued}/${b.total}`;
+        rows.push([{ text: label.slice(0, 64), callback_data: `queue_batch:${b.batch_id || ''}` }]);
+    }
+    rows.push([{ text: '🧹 Purge Done', callback_data: 'queue_purge_done' }]);
+    rows.push([{ text: '⬅️ Back to Home', callback_data: 'home_back' }]);
+    return { inline_keyboard: rows };
+};
+
+const buildQueueBatchKeyboard = (batchId) => ({
+    inline_keyboard: [
+        [{ text: '▶️ Run This Batch', callback_data: `queue_run_batch:${batchId}` }],
+        [{ text: '🗑 Delete Batch',    callback_data: `queue_del_batch:${batchId}` }],
+        [{ text: '⬅️ Back to Queue',   callback_data: 'home_open:queue_menu' }]
     ]
 });
 
@@ -1335,9 +1372,65 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     process.exit(1);
 }
 
+/**
+ * One-shot startup migration: read every legacy `to scrape/*.txt|*.csv`,
+ * enqueue the URLs into the DB queue (one batch per file so users can still
+ * scrape them in isolation), then move the file into `to scrape/.migrated/`
+ * so it doesn't get re-ingested on the next boot.
+ *
+ * The DB queue is now the source of truth; the folder is only kept as a
+ * drop-zone for manual URL lists (users can still put a file there and the
+ * next boot will fold it in).
+ */
+const ingestLegacyToScrapeFolder = () => {
+    const toScrapeDir = path.join(process.cwd(), 'to scrape');
+    if (!fs.existsSync(toScrapeDir)) return;
+
+    let files;
+    try {
+        files = fs.readdirSync(toScrapeDir).filter(f => f.endsWith('.txt') || f.endsWith('.csv'));
+    } catch (err) {
+        console.error(`Queue ingest: failed to read ${toScrapeDir}: ${err.message}`);
+        return;
+    }
+    if (files.length === 0) return;
+
+    const migratedDir = path.join(toScrapeDir, '.migrated');
+    try {
+        if (!fs.existsSync(migratedDir)) fs.mkdirSync(migratedDir, { recursive: true });
+    } catch (err) {
+        console.error(`Queue ingest: failed to create ${migratedDir}: ${err.message}`);
+        return;
+    }
+
+    let totalInserted = 0;
+    for (const file of files) {
+        const filePath = path.join(toScrapeDir, file);
+        try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            const urls = (content.match(/https?:\/\/[^\s"'<>`]+/g) || [])
+                .map(u => u.trim()).filter(Boolean);
+            if (urls.length > 0) {
+                const slug = file.replace(/\.(txt|csv)$/i, '').slice(0, 60);
+                const batchId = makeBatchId('file_ingest', slug);
+                const { inserted } = enqueueUrls(urls, { source: `file:${file}`, batchId });
+                totalInserted += inserted;
+                console.log(`📥 Queue ingest: ${file} → ${inserted} URL(s) (batch ${batchId})`);
+            }
+            fs.renameSync(filePath, path.join(migratedDir, `${Date.now()}_${file}`));
+        } catch (err) {
+            console.error(`Queue ingest: failed on ${file}: ${err.message}`);
+        }
+    }
+    if (totalInserted > 0) {
+        console.log(`✅ Queue ingest complete: ${totalInserted} URL(s) from ${files.length} file(s) moved to .migrated/`);
+    }
+};
+
 // Create a bot that uses 'polling' to fetch new updates
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 initializeScraper();
+ingestLegacyToScrapeFolder();
 startDownloadServer();
 bot.setMyCommands(BOT_COMMANDS).catch(error => {
     console.error(`Failed to set Telegram bot commands: ${error.message}`);
@@ -2864,6 +2957,59 @@ bot.on('callback_query', async (callbackQuery) => {
     if (data === 'home_open:retry_menu') {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await sendOrEditMenu(msg.chat.id, 'Choose which URLs to retry:', buildRetryTypeKeyboard(), msg);
+        return;
+    }
+
+    if (data === 'home_open:queue_menu') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        const total = countQueued();
+        const header = total === 0
+            ? '🗂 Scrape Queue is empty.'
+            : `🗂 Scrape Queue — ${total} URL(s) pending across ${listQueueBatches().length} batch(es).`;
+        await sendOrEditMenu(msg.chat.id, header, buildQueueMenuKeyboard(), msg);
+        return;
+    }
+
+    if (data.startsWith('queue_batch:')) {
+        const batchId = data.slice('queue_batch:'.length);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        const b = listQueueBatches().find(x => (x.batch_id || '') === batchId);
+        const text = b
+            ? `🗂 Batch: ${batchId || '(no batch)'}\nSource: ${b.source || '-'}\nQueued: ${b.queued} · Scraping: ${b.scraping} · Done: ${b.done} · Failed: ${b.failed}\nFirst seen: ${b.first_seen}\nLast update: ${b.last_updated}`
+            : `🗂 Batch: ${batchId} (not found)`;
+        await sendOrEditMenu(msg.chat.id, text, buildQueueBatchKeyboard(batchId), msg);
+        return;
+    }
+
+    if (data === 'queue_run_all' || data.startsWith('queue_run_batch:')) {
+        const batchId = data.startsWith('queue_run_batch:') ? data.slice('queue_run_batch:'.length) : null;
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        const urls = batchId ? getQueuedUrls({ batchId }) : getQueuedUrls({});
+        if (urls.length === 0) {
+            await sendPlainMessage('Queue is empty — nothing to scrape.', msg.chat.id);
+            return;
+        }
+        const label = batchId ? `Queue:${batchId}` : 'Queue:All';
+        await withBotStatus('scraping', 'queue', async () => {
+            await runTrackedUrlListScrape(msg.chat.id, label, urls);
+        });
+        return;
+    }
+
+    if (data.startsWith('queue_del_batch:')) {
+        const batchId = data.slice('queue_del_batch:'.length);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        const removed = deleteQueueBatch(batchId);
+        await sendPlainMessage(`🗑 Deleted ${removed} row(s) from batch ${batchId}.`, msg.chat.id);
+        await sendOrEditMenu(msg.chat.id, '🗂 Scrape Queue', buildQueueMenuKeyboard(), msg);
+        return;
+    }
+
+    if (data === 'queue_purge_done') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        const removed = purgeDoneFromQueue();
+        await sendPlainMessage(`🧹 Purged ${removed} finished row(s) from the queue.`, msg.chat.id);
+        await sendOrEditMenu(msg.chat.id, '🗂 Scrape Queue', buildQueueMenuKeyboard(), msg);
         return;
     }
 

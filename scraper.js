@@ -5,7 +5,7 @@ import readlineSync from 'readline-sync';
 import fs from 'fs';
 import path from 'path';
 import { runSitemapScraper, rescanSavedSitemaps, runBulkSitemapScraper, runSitemapScraperCLI } from './xml.js';
-import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus, getDomainVariable, saveSocialLead, removeQueuedUrl } from './db.js';
+import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus, getDomainVariable, saveSocialLead, removeQueuedUrl, getQueuedUrls, markQueueScraping, markQueueDone, markQueueFailed } from './db.js';
 
 // Configuration
 const TIMEOUT = 15000; // 15 seconds
@@ -1034,23 +1034,28 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
             if (sourceFilePath) {
                 removeLineFromFile(sourceFilePath, rawUrl);
             }
-            removeQueuedUrl(url);
+            // Already scraped before — mark the queue row Done (not re-scraped now).
+            markQueueDone(url);
             progress.processedUrls++;
             progress.skippedCount++;
             await emitProgress('progress', { currentUrl: url, lastStatus: 'Skipped' });
             return;
         }
-        
+
+        // Announce this URL as in-flight so the UI can surface live progress
+        // and an interrupted run can tell "claimed but not finished" from "queued".
+        markQueueScraping(url);
+
         const result = await scrapeSocialLinks(url);
-        
+
         // Remove from file immediately after processing (success or fail)
         if (sourceFilePath) {
             removeLineFromFile(sourceFilePath, rawUrl);
         }
-        removeQueuedUrl(url);
         
         if (result.error) {
             logScrapeResult(url, 'Failed', result.error);
+            markQueueFailed(url);
             console.log(`❌ Failed: ${url} (${result.error})`);
             progress.processedUrls++;
             progress.failedCount++;
@@ -1080,6 +1085,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
             progress.linkedinLeadKeys = Array.from(linkedinLeadSet);
             progress.instagramLeadKeys = Array.from(instagramLeadSet);
             logScrapeResult(url, 'Success', `Found ${result.socials.length} links`);
+            markQueueDone(url);
             console.log(`✅ Found ${result.socials.length} links:`);
             result.socials.forEach(item => {
                 console.log(`   - [${item.platform.toUpperCase()}] ${item.link}`);
@@ -1092,6 +1098,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
             await emitProgress('progress', { currentUrl: url, lastStatus: 'Success' });
         } else {
             logScrapeResult(url, 'No_Result', 'No links found');
+            markQueueDone(url);
             console.log('⚠️  No links found (Marked as No Result).');
             progress.processedUrls++;
             progress.noResultCount++;
@@ -1124,6 +1131,31 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
     console.log('\n========================================');
     await emitProgress('complete');
     return { ...progress, elapsedMs: Date.now() - startedAt };
+}
+
+/**
+ * Run the scraper against URLs drawn from the DB work queue.
+ * If `batchId` is provided, only URLs in that batch are pulled; otherwise all
+ * currently-Queued URLs are processed (FIFO by discovered_at).
+ *
+ * Per-URL queue status is advanced by `runScraper` itself
+ * (Scraping → Done/Failed), so an interrupted run leaves a clean record.
+ *
+ * @param {{ batchId?: string|null, force?: boolean, onProgress?: Function, signal?: AbortSignal }} opts
+ */
+export async function runScraperFromQueue({ batchId = null, force = false, onProgress, signal } = {}) {
+    const urls = getQueuedUrls({ batchId });
+    if (urls.length === 0) {
+        if (typeof onProgress === 'function') {
+            await onProgress({ stage: 'complete', totalUrls: 0, processedUrls: 0, elapsedMs: 0, batchId });
+        }
+        return {
+            totalUrls: 0, processedUrls: 0, successCount: 0, failedCount: 0,
+            noResultCount: 0, skippedCount: 0, elapsedMs: 0, batchId
+        };
+    }
+    const result = await runScraper(urls, null, force, { onProgress, signal });
+    return { ...result, batchId };
 }
 
 /**

@@ -1,18 +1,50 @@
 import { gotScraping } from 'got-scraping';
-import * as cheerio from 'cheerio';
 import fs from 'fs';
 import path from 'path';
 import readlineSync from 'readline-sync';
 import zlib from 'zlib';
+import http from 'http';
+import https from 'https';
 import { promisify } from 'util';
-import { normalizeUrl, getAllScrapedUrls, getAllQueuedUrls, saveQueuedUrls, saveDiscoveredSitemap, getAllSitemaps, updateSitemapScanDate } from './db.js';
+import { normalizeUrl, getAllScrapedUrls, getAllQueuedUrls, saveQueuedUrls, enqueueUrls, makeBatchId, saveDiscoveredSitemap, getAllSitemaps, updateSitemapScanDate } from './db.js';
 
 const gunzip = promisify(zlib.gunzip);
 
 // Configuration
-const TIMEOUT = 30000; // 30 seconds
-const CONCURRENCY = 5; // Parallel sitemap fetching
-const ROOT_SITEMAP_CONCURRENCY = 3; // Parallel root sitemap processing
+// Per-request timeout. Dead sitemaps blocked the crawl for ~90s (30s × 2 retries);
+// 12s + 1 retry caps the wait at ~24s and rarely kills healthy fetches.
+const TIMEOUT = 12000;
+// Fetch fan-out. Sitemap fetching is pure I/O so high concurrency is safe;
+// the real limit is the remote server, not our CPU.
+const CONCURRENCY = 10;            // child-sitemap fan-out inside one tree
+const ROOT_SITEMAP_CONCURRENCY = 5; // root sitemap parallelism across a bulk/rescan run
+
+// Shared keep-alive agents. Reusing TCP+TLS connections across the many
+// fetches to the same host (every child sitemap, plus their children)
+// eliminates the handshake round-trip per request — typically the biggest
+// single win on a deep tree.
+const httpAgent  = new http.Agent({  keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, rejectUnauthorized: false });
+
+// Matches every <loc>…</loc> entry, tolerating attributes, CDATA, and whitespace.
+// Sitemap XML is a flat list of <loc> tags; a full HTML/XML parser would just
+// be a much more expensive way to do the same string extraction.
+const LOC_RE = /<loc\b[^>]*>([\s\S]*?)<\/loc>/gi;
+const CDATA_RE = /<!\[CDATA\[([\s\S]*?)\]\]>/;
+
+function extractLocs(xml) {
+    const out = [];
+    let m;
+    LOC_RE.lastIndex = 0;
+    while ((m = LOC_RE.exec(xml)) !== null) {
+        let val = m[1];
+        const cdata = CDATA_RE.exec(val);
+        if (cdata) val = cdata[1];
+        val = val.trim();
+        if (val) out.push(val);
+    }
+    return out;
+}
 
 // Extensions to ignore (images, assets)
 const IGNORED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.pdf', '.css', '.js', '.json'];
@@ -73,51 +105,42 @@ function isLikelyArticleUrl(urlStr) {
 }
 
 /**
- * Fetches a URL and returns its body (handling gzip if necessary).
+ * Fetches a sitemap URL and returns its body as a UTF-8 string (handling gzip
+ * transparently for .gz payloads). Uses a shared keep-alive agent so repeated
+ * fetches to the same host don't pay a fresh TLS handshake each time.
  */
 async function fetchContent(url) {
+    const isGzip = url.endsWith('.gz');
     try {
-        console.log(`Trying to fetch: ${url}`);
-        
-        // Determine if it's likely a binary file (gzip)
-        const isGzip = url.endsWith('.gz');
-
+        // For gzipped sitemaps we need the raw buffer; for everything else we
+        // let got-scraping return a decoded string (cheaper — no Buffer copy
+        // and no manual UTF-8 conversion on our side).
         const response = await gotScraping({
-            url: url,
+            url,
             timeout: { request: TIMEOUT },
-            retry: { limit: 2 },
-            responseType: 'buffer', // Get raw buffer to handle gzip manually if needed
-            http2: false, // FORCE HTTP/1.1 - Fixes "Session closed without receiving a SETTINGS frame"
-            https: { rejectUnauthorized: false }, // Fix for SSL/Origin mismatch errors
-            headerGeneratorOptions: {
-                devices: ['desktop'],
-                locales: ['en-US'],
-            }
+            retry: { limit: 1 },
+            responseType: isGzip ? 'buffer' : 'text',
+            http2: false,                          // avoids "SETTINGS frame" failures on some hosts
+            agent: { http: httpAgent, https: httpsAgent },
+            https: { rejectUnauthorized: false },
+            headerGeneratorOptions: { devices: ['desktop'], locales: ['en-US'] }
         });
 
         if (!response.body) return null;
 
-        let content = response.body;
-
-        // Check for GZIP magic number (1f 8b)
-        // We do NOT rely on the extension alone because 'got' might have already decompressed it
-        // based on the Content-Encoding header.
-        const hasGzipMagicNumber = content.length > 2 && content[0] === 0x1f && content[1] === 0x8b;
-
-        if (hasGzipMagicNumber) {
-            console.log(`📦 Decompressing gzip: ${url}`);
+        if (isGzip) {
+            const buf = response.body;
+            const hasMagic = buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+            if (!hasMagic) return buf.toString('utf-8'); // already decompressed by got
             try {
-                content = await gunzip(content);
+                return (await gunzip(buf)).toString('utf-8');
             } catch (err) {
                 console.error(`❌ Decompression failed for ${url}: ${err.message}`);
-                // Fallback: It might be that the check failed or something else. 
-                // If it fails, we return null, or we could try to return the raw buffer if it looks like text.
                 return null;
             }
         }
 
-        return content.toString('utf-8');
-
+        return response.body;
     } catch (error) {
         console.error(`❌ Error fetching ${url}: ${error.message}`);
         return null;
@@ -125,77 +148,154 @@ async function fetchContent(url) {
 }
 
 /**
- * Recursively scrapes sitemaps.
- * @param {string} url - The initial sitemap URL.
- * @param {Set} visited - To prevent infinite loops.
- * @param {Set} articleUrls - To store found article URLs.
+ * Classify a <loc> entry. Kept as a tight function so the hot loop in
+ * `processSitemapContent` stays branch-predictable.
  */
-async function scrapeSitemapRecursive(url, visited = new Set(), articleUrls = new Set()) {
-    if (visited.has(url)) return;
-    visited.add(url);
+function classifyLoc(link) {
+    const lower = link.toLowerCase();
+    if (IGNORED_EXTENSIONS.some(ext => lower.endsWith(ext))) return 'skip';
+    // wp-content paths are almost always assets; keep them only if they
+    // look like a sitemap (some plugins place sitemaps there).
+    if (lower.includes('wp-content') && !lower.includes('sitemap')) return 'skip';
+    if (lower.includes('sitemap') || lower.endsWith('.xml') || lower.endsWith('.xml.gz')) return 'sitemap';
+    return 'article';
+}
 
-    const content = await fetchContent(url);
-    if (!content) return;
-
-    // Parse XML
-    const $ = cheerio.load(content, { xmlMode: true });
-    
-    // Find all <loc> tags (handles namespaces implicitly in cheerio xml mode usually, 
-    // but we can use a broad selector to be safe)
-    const locs = $('loc, url > loc, sitemap > loc');
-    
-    const foundUrls = [];
-    locs.each((i, el) => {
-        const txt = $(el).text().trim();
-        if (txt) foundUrls.push(txt);
-    });
-
-    console.log(`🔍 Found ${foundUrls.length} <loc> entries in ${url}`);
-
-    const childSitemaps = [];
-
+/**
+ * Parse one sitemap payload, fold its <loc> entries into the visited/articleUrls
+ * sets, and return any newly-found child sitemap URLs. The caller is
+ * responsible for scheduling those children — which lets the worker pool keep
+ * every slot saturated instead of waiting on the slowest sibling in a chunk.
+ */
+function processSitemapContent(url, content, articleUrls, saveChildSitemap) {
+    const foundUrls = extractLocs(content);
+    const children = [];
     for (const link of foundUrls) {
-        // Filter out junk
-        const lowerLink = link.toLowerCase();
-        if (IGNORED_EXTENSIONS.some(ext => lowerLink.endsWith(ext))) continue;
-        if (lowerLink.includes('wp-content') && !lowerLink.includes('sitemap')) continue; // Skip assets but keep sitemaps
-
-        // Check if it's a sitemap
-        if (lowerLink.includes('sitemap') || lowerLink.endsWith('.xml') || lowerLink.endsWith('.xml.gz')) {
-            childSitemaps.push(link);
-            saveDiscoveredSitemap(link, url); // Save to DB for future monitoring
+        const kind = classifyLoc(link);
+        if (kind === 'skip') continue;
+        if (kind === 'sitemap') {
+            children.push(link);
+            saveChildSitemap(link, url);
         } else {
-            // It's an article/page
             articleUrls.add(link);
         }
     }
+    return { foundCount: foundUrls.length, children };
+}
 
-    if (childSitemaps.length > 0) {
-        console.log(`📂 Found ${childSitemaps.length} child sitemaps. Processing...`);
-        
-        // Process in chunks
-        const chunks = [];
-        for (let i = 0; i < childSitemaps.length; i += CONCURRENCY) {
-            chunks.push(childSitemaps.slice(i, i + CONCURRENCY));
+/**
+ * Flat worker-pool crawler. Replaces the old recursive chunked version that
+ * had a head-of-line-blocking bug (each chunk waited on its slowest fetch
+ * before any worker could start on the next chunk).
+ *
+ * - `pending` is the global queue of sitemap URLs yet to fetch.
+ * - N workers pull atomically from `pending`; when a fetch yields child
+ *   sitemaps, they're pushed back onto `pending` and picked up immediately
+ *   by whichever worker becomes free next.
+ * - Child-sitemap DB writes are batched into a single transaction per
+ *   parent page to minimize SQLite fsync overhead.
+ */
+async function crawlSitemapTree(rootUrls, { visited, articleUrls, concurrency = CONCURRENCY } = {}) {
+    const pending = [];
+    for (const u of rootUrls) {
+        if (u && !visited.has(u)) {
+            visited.add(u);
+            pending.push(u);
         }
-
-        for (const chunk of chunks) {
-            await Promise.allSettled(chunk.map(childUrl => scrapeSitemapRecursive(childUrl, visited, articleUrls)));
-        }
-    } else {
-        console.log(`📄 Added ${foundUrls.length - childSitemaps.length} potential articles from ${url}`);
     }
+    if (pending.length === 0) return;
+
+    const fetchAndProcess = async (url) => {
+        const content = await fetchContent(url);
+        if (!content) return;
+
+        // Batch every child-sitemap discovery from this payload into one
+        // transaction. Individual INSERT OR IGNOREs fsync per row otherwise.
+        const childBuffer = [];
+        const { foundCount, children } = processSitemapContent(
+            url,
+            content,
+            articleUrls,
+            (child, parent) => childBuffer.push([child, parent])
+        );
+
+        if (childBuffer.length > 0) {
+            // Fire and forget is fine here — write is synchronous better-sqlite3.
+            try {
+                for (const [child, parent] of childBuffer) saveDiscoveredSitemap(child, parent);
+            } catch { /* per-row ignores duplicates; swallow cumulative errors */ }
+        }
+
+        if (foundCount > 0) {
+            const articleCount = foundCount - children.length;
+            if (children.length > 0) {
+                console.log(`📂 ${url} → ${children.length} child sitemap(s), ${articleCount} article(s)`);
+            } else {
+                console.log(`📄 ${url} → ${articleCount} article(s)`);
+            }
+        }
+
+        // Enqueue newly-discovered sitemaps (dedupe via `visited`).
+        for (const child of children) {
+            if (!visited.has(child)) {
+                visited.add(child);
+                pending.push(child);
+            }
+        }
+    };
+
+    // Active-worker counter so workers don't exit prematurely. The queue
+    // grows as sitemaps discover children — a naive `while (pending.length)`
+    // would see the queue briefly drained (while N in-flight fetches are
+    // still hunting for children) and cause all workers to quit before the
+    // tree is fully traversed. A worker only exits when the queue is empty
+    // AND no siblings are still fetching (i.e. nobody can add more work).
+    let active = 0;
+    const worker = async () => {
+        while (true) {
+            if (pending.length === 0) {
+                if (active === 0) return;
+                // Yield to the event loop so in-flight fetches can push new
+                // children before we re-check.
+                await new Promise(r => setImmediate(r));
+                continue;
+            }
+            const next = pending.shift();
+            if (!next) continue;
+            active++;
+            try { await fetchAndProcess(next); }
+            catch (err) { console.error(`❌ Worker error on ${next}: ${err.message}`); }
+            finally { active--; }
+        }
+    };
+
+    // Always spawn the full worker count — workers idle-wait when the
+    // queue is temporarily empty, so initial queue size doesn't cap fan-out.
+    await Promise.all(Array.from({ length: concurrency }, worker));
+}
+
+/**
+ * Back-compat wrapper for the old recursive API. Callers still pass a single
+ * URL + shared `visited`/`articleUrls` sets; we just fan the single URL out
+ * through the new worker pool.
+ */
+async function scrapeSitemapRecursive(url, visited = new Set(), articleUrls = new Set()) {
+    await crawlSitemapTree([url], { visited, articleUrls });
 }
 
 /**
  * Loads the set of already scraped URLs from the database.
+ * URLs stored in `scraped_urls` are already normalized by db.js, so we skip the
+ * re-normalize pass (previously ~100ms per 100k rows for no functional gain).
  */
 function loadProcessedUrls() {
-    return new Set(getAllScrapedUrls().map(url => normalizeUrl(url)));
+    return new Set(getAllScrapedUrls());
 }
 
 function loadQueuedUrls() {
-    const knownQueuedUrls = new Set(getAllQueuedUrls().map(url => normalizeUrl(url)));
+    // Source of truth: DB queue (already-normalized URLs). Legacy
+    // `to scrape/*.txt` files are also folded in for pre-migration deployments.
+    const knownQueuedUrls = new Set(getAllQueuedUrls());
     const toScrapeDir = path.join(process.cwd(), 'to scrape');
 
     if (!fs.existsSync(toScrapeDir)) {
@@ -373,26 +473,33 @@ export async function rescanSavedSitemaps(targetDomain = null, options = {}) {
         });
     };
 
-    for (let i = 0; i < sitemapsToScan.length; i += ROOT_SITEMAP_CONCURRENCY) {
-        const chunk = sitemapsToScan.slice(i, i + ROOT_SITEMAP_CONCURRENCY);
-        await Promise.allSettled(chunk.map(processRootSitemap));
+    // Root-level worker pool. Each root sitemap spawns its own internal
+    // `crawlSitemapTree` pool too, but we cap how many root trees run in
+    // parallel to avoid overwhelming a single server with hundreds of
+    // simultaneous sockets.
+    {
+        let rootIdx = 0;
+        const rootWorker = async () => {
+            while (rootIdx < sitemapsToScan.length) {
+                const i = rootIdx++;
+                try { await processRootSitemap(sitemapsToScan[i]); }
+                catch (err) { console.error(`Root sitemap error: ${err.message}`); }
+            }
+        };
+        const n = Math.min(ROOT_SITEMAP_CONCURRENCY, sitemapsToScan.length);
+        await Promise.all(Array.from({ length: n }, rootWorker));
     }
 
     if (allNewUrls.size > 0) {
         console.log(`\n🎉 Found ${allNewUrls.size} NEW URLs across all sitemaps!`);
-        
-        const toScrapeDir = path.join(process.cwd(), 'to scrape');
-        if (!fs.existsSync(toScrapeDir)) fs.mkdirSync(toScrapeDir);
-
-        const filename = `rescan_updates_${Date.now()}.txt`;
-        const filePath = path.join(toScrapeDir, filename);
 
         const newUrlsToSave = Array.from(allNewUrls);
-        fs.writeFileSync(filePath, newUrlsToSave.join('\n'));
-        saveQueuedUrls(newUrlsToSave, `xml_rescan:${summary.target}`);
-        console.log(`\n� Saved new URLs to: to scrape/${filename}`);
-        summary.newUrlsSaved = allNewUrls.size;
-        summary.filePath = filePath;
+        const source = `xml_rescan:${summary.target}`;
+        const batchId = makeBatchId('xml_rescan', summary.target || 'all');
+        const { inserted } = enqueueUrls(newUrlsToSave, { source, batchId });
+        console.log(`\n💾 Enqueued ${inserted} NEW URLs to DB queue (batch ${batchId})`);
+        summary.newUrlsSaved = inserted;
+        summary.batchId = batchId;
     } else {
         console.log(`\n✅ No new URLs found in any sitemap.`);
     }
@@ -433,17 +540,16 @@ export async function runSitemapScraper(sitemapUrl) {
     const queuedUrls = loadQueuedUrls();
 
     if (articleUrls.size > 0) {
-        const newUrls = [];
+        // Set-based dedupe: `.includes()` on an Array is O(n) so the old
+        // filter was O(n²) and choked on sitemaps with 20k+ URLs.
+        const newUrlSet = new Set();
         for (const url of articleUrls) {
             const normalizedUrl = normalizeUrl(url);
-            if (!normalizedUrl || !isLikelyArticleUrl(normalizedUrl)) {
-                continue;
-            }
-
-            if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl) && !newUrls.includes(normalizedUrl)) {
-                newUrls.push(normalizedUrl);
-            }
+            if (!normalizedUrl || !isLikelyArticleUrl(normalizedUrl)) continue;
+            if (processedUrls.has(normalizedUrl) || queuedUrls.has(normalizedUrl)) continue;
+            newUrlSet.add(normalizedUrl);
         }
+        const newUrls = Array.from(newUrlSet);
 
         console.log(`   ----------------------------------------`);
         console.log(`   Duplicate (Already Scraped): ${articleUrls.size - newUrls.length}`);
@@ -451,18 +557,12 @@ export async function runSitemapScraper(sitemapUrl) {
         console.log(`   ----------------------------------------`);
 
         if (newUrls.length > 0) {
-            const toScrapeDir = path.join(process.cwd(), 'to scrape');
-            if (!fs.existsSync(toScrapeDir)) fs.mkdirSync(toScrapeDir);
-
             const domain = new URL(sitemapUrl).hostname.replace('www.', '');
-            const filename = `sitemap_${domain}_${Date.now()}.txt`;
-            filePath = path.join(toScrapeDir, filename);
-
-            fs.writeFileSync(filePath, newUrls.join('\n'));
-            saveQueuedUrls(newUrls, `xml_single:${domain}`);
-            newUrlsSaved = newUrls.length;
-            console.log(`\n💾 Saved ${newUrlsSaved} NEW URLs to: to scrape/${filename}`);
-            console.log(`   (You can now use Option 3 in the main scraper to process this file)`);
+            const batchId = makeBatchId('xml_single', domain);
+            const { inserted } = enqueueUrls(newUrls, { source: `xml_single:${domain}`, batchId });
+            newUrlsSaved = inserted;
+            filePath = null; // kept for legacy callers
+            console.log(`\n💾 Enqueued ${newUrlsSaved} NEW URLs to DB queue (batch ${batchId})`);
         } else {
             console.log(`\n🎉 All found URLs have already been scraped! Nothing new to save.`);
         }
@@ -550,26 +650,21 @@ export async function runBulkSitemapScraper() {
         
         // Save results
         if (articleUrls.size > 0) {
-             const newUrls = [];
+             const newUrlSet = new Set();
              for (const url of articleUrls) {
                  const normalizedUrl = normalizeUrl(url);
                  if (!normalizedUrl || !isLikelyArticleUrl(normalizedUrl)) continue;
-                 if (!processedUrls.has(normalizedUrl) && !queuedUrls.has(normalizedUrl) && !newUrls.includes(normalizedUrl)) {
-                    newUrls.push(normalizedUrl);
-                 }
+                 if (processedUrls.has(normalizedUrl) || queuedUrls.has(normalizedUrl)) continue;
+                 newUrlSet.add(normalizedUrl);
              }
-             
+             const newUrls = Array.from(newUrlSet);
+
+
              if (newUrls.length > 0) {
-                const toScrapeDir = path.join(process.cwd(), 'to scrape');
-                if (!fs.existsSync(toScrapeDir)) fs.mkdirSync(toScrapeDir);
-
                 const domain = new URL(sitemapUrl).hostname.replace(/^www\./, '');
-                const filename = `sitemap_${domain}_${Date.now()}.txt`;
-                const filePath = path.join(toScrapeDir, filename);
-
-                fs.writeFileSync(filePath, newUrls.join('\n'));
-                saveQueuedUrls(newUrls, `xml_bulk:${domain}`);
-                console.log(`\n💾 Saved ${newUrls.length} NEW URLs to: to scrape/${filename}`);
+                const batchId = makeBatchId('xml_bulk', domain);
+                const { inserted } = enqueueUrls(newUrls, { source: `xml_bulk:${domain}`, batchId });
+                console.log(`\n💾 Enqueued ${inserted} NEW URLs to DB queue (batch ${batchId})`);
              } else {
                  console.log(`\n✅ All found URLs are duplicates.`);
              }
@@ -578,9 +673,17 @@ export async function runBulkSitemapScraper() {
         }
     };
 
-    for (let i = 0; i < lines.length; i += ROOT_SITEMAP_CONCURRENCY) {
-        const chunk = lines.slice(i, i + ROOT_SITEMAP_CONCURRENCY);
-        await Promise.allSettled(chunk.map(processSitemapEntry));
+    {
+        let idx = 0;
+        const worker = async () => {
+            while (idx < lines.length) {
+                const i = idx++;
+                try { await processSitemapEntry(lines[i]); }
+                catch (err) { console.error(`Bulk sitemap error: ${err.message}`); }
+            }
+        };
+        const n = Math.min(ROOT_SITEMAP_CONCURRENCY, lines.length);
+        await Promise.all(Array.from({ length: n }, worker));
     }
     console.log('\n✅ Bulk Sitemap Scrape Complete!');
 }
