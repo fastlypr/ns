@@ -50,8 +50,9 @@ db.exec(`
         updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_queued_urls_updated_at ON queued_urls(updated_at);
-    CREATE INDEX IF NOT EXISTS idx_queued_urls_batch_status ON queued_urls(batch_id, status);
-    CREATE INDEX IF NOT EXISTS idx_queued_urls_status ON queued_urls(status);
+    -- NOTE: indexes on batch_id/status are created *after* the ALTER TABLE
+    -- migration below, because existing installs may not yet have those
+    -- columns when this CREATE TABLE IF NOT EXISTS is a no-op.
     CREATE TABLE IF NOT EXISTS social_leads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         domain TEXT NOT NULL,
