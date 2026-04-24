@@ -2324,7 +2324,148 @@ const withBotStatus = async (status, task, action) => {
 
 const getCurrentAbortSignal = () => currentAbortController?.signal;
 
+/* ------------------------------------------------------------------
+ * Auto XML Rescan + Queue Drain
+ * ------------------------------------------------------------------
+ * Every N hours, rescan all saved sitemaps. Any new URLs discovered
+ * are enqueued by rescanSavedSitemaps() itself. If the queue has
+ * pending work afterwards, kick off a scrape run in the same tick.
+ *
+ * Mutual exclusion with manual tasks: we only start a cycle when
+ * botStatus === 'idle'; otherwise we skip this tick and try again on
+ * the next interval. The scan itself runs inside withBotStatus, so
+ * manual actions will see botStatus !== 'idle' and decline to start
+ * until the auto cycle finishes.
+ * ------------------------------------------------------------------ */
+const AUTO_SITEMAP_INTERVAL_HOURS = 5;
+let autoSitemapTimer = null;
+let autoSitemapCycleInProgress = false;
+
+const runAutoSitemapCycle = async (trigger = 'scheduled') => {
+    if (autoSitemapCycleInProgress) {
+        console.log(`[AutoSitemap] Cycle skipped (${trigger}): previous cycle still running.`);
+        return;
+    }
+    if (botStatus !== 'idle') {
+        console.log(`[AutoSitemap] Cycle skipped (${trigger}): bot busy with '${botStatus}'. Will retry next interval.`);
+        return;
+    }
+
+    autoSitemapCycleInProgress = true;
+    const startedAt = new Date();
+    console.log(`[AutoSitemap] Cycle starting (${trigger}) at ${startedAt.toISOString()}`);
+
+    try {
+        // Phase 1 — Rescan all saved sitemaps. Runs under withBotStatus so
+        // it blocks manual work for its duration.
+        let scanSummary = null;
+        try {
+            await withBotStatus('sitemap_rescan', `auto_rescan:${trigger}`, async () => {
+                scanSummary = await rescanSavedSitemaps('all', {
+                    onProgress: async () => { /* silent for scheduled runs */ }
+                });
+            });
+        } catch (err) {
+            console.error(`[AutoSitemap] Rescan failed: ${err.message}`);
+        }
+
+        const newUrls = scanSummary?.newUrlsSaved ?? scanSummary?.newUrlsFound ?? 0;
+        if (scanSummary) {
+            console.log(`[AutoSitemap] Rescan complete — new URLs queued: ${newUrls}`);
+            // Telegram notification, silent if chat id is unset
+            if (TELEGRAM_CHAT_ID) {
+                try {
+                    await sendPlainMessage(
+                        `🤖 Auto Sitemap Rescan complete\n` +
+                        `New URLs queued: ${newUrls}\n` +
+                        `Root sitemaps visited: ${scanSummary.uniqueSitemapsVisited ?? '-'}`,
+                        TELEGRAM_CHAT_ID
+                    );
+                } catch { /* ignore notification failures */ }
+            }
+        }
+
+        // Phase 2 — If the queue has pending URLs, drain it (single scrape run).
+        const pending = countQueued();
+        if (pending === 0) {
+            console.log(`[AutoSitemap] Queue empty after rescan — nothing to scrape.`);
+            return;
+        }
+
+        // Pre-scrape purge, identical to the manual Run All path, to avoid
+        // wasted "Skipping (Already Scraped)" work.
+        try {
+            const removed = purgeAlreadyScrapedFromQueue();
+            if (removed > 0) {
+                console.log(`[AutoSitemap] Pre-scrape cleanup removed ${removed} already-scraped URL(s).`);
+            }
+        } catch (err) {
+            console.error(`[AutoSitemap] Pre-scrape cleanup failed: ${err.message}`);
+        }
+
+        const rawUrls = getQueuedUrls({});
+        const urls = [];
+        for (const u of rawUrls) {
+            if (urlExists(u)) {
+                removeQueuedUrl(u);
+            } else {
+                urls.push(u);
+            }
+        }
+
+        if (urls.length === 0) {
+            console.log(`[AutoSitemap] Nothing new to scrape after filtering.`);
+            return;
+        }
+
+        console.log(`[AutoSitemap] Draining queue: ${urls.length} URL(s)`);
+        if (TELEGRAM_CHAT_ID) {
+            try {
+                await sendPlainMessage(
+                    `🤖 Auto-scraping ${urls.length} queued URL(s) discovered by sitemap rescan.`,
+                    TELEGRAM_CHAT_ID
+                );
+            } catch { /* ignore */ }
+        }
+
+        try {
+            await withBotStatus('scraping', `auto_queue:${trigger}`, async () => {
+                await runTrackedUrlListScrape(
+                    TELEGRAM_CHAT_ID,
+                    `AutoQueue:${trigger}`,
+                    urls
+                );
+            });
+        } catch (err) {
+            console.error(`[AutoSitemap] Queue drain failed: ${err.message}`);
+        }
+    } finally {
+        autoSitemapCycleInProgress = false;
+        const finishedAt = new Date();
+        const durationSec = Math.round((finishedAt - startedAt) / 1000);
+        console.log(`[AutoSitemap] Cycle finished in ${durationSec}s`);
+    }
+};
+
+const startAutoSitemapScheduler = () => {
+    if (autoSitemapTimer) {
+        clearInterval(autoSitemapTimer);
+        autoSitemapTimer = null;
+    }
+    const ms = AUTO_SITEMAP_INTERVAL_HOURS * 60 * 60 * 1000;
+    autoSitemapTimer = setInterval(() => {
+        runAutoSitemapCycle('scheduled').catch(err => {
+            console.error(`[AutoSitemap] Unhandled scheduler error: ${err.message}`);
+        });
+    }, ms);
+    if (typeof autoSitemapTimer.unref === 'function') {
+        autoSitemapTimer.unref();
+    }
+    console.log(`[AutoSitemap] Scheduler started — every ${AUTO_SITEMAP_INTERVAL_HOURS}h.`);
+};
+
 startPageTrackerScheduler();
+startAutoSitemapScheduler();
 notifyDeployStatusIfPresent().catch(error => {
     console.error(`Failed to process deploy status notification: ${error.message}`);
 });
