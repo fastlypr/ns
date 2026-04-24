@@ -465,7 +465,20 @@ export function setQueueUrlStatus(url, status) {
 }
 
 export const markQueueScraping = (url) => setQueueUrlStatus(url, 'Scraping');
-export const markQueueDone     = (url) => setQueueUrlStatus(url, 'Done');
+/**
+ * A scraped-or-skipped URL no longer needs to live in the queue — its outcome
+ * is already persisted in `scraped_urls`. Delete the row so the queue view
+ * stays clean and "Run All Queued" doesn't re-pick it up.
+ */
+export const markQueueDone = (url) => {
+    const normalized = normalizeUrl(String(url || '').trim());
+    if (!normalized) return;
+    try {
+        deleteQueuedUrlStmt.run(normalized);
+    } catch (err) {
+        console.error(`Database Error (Queue Done delete): ${err.message}`);
+    }
+};
 export const markQueueFailed   = (url) => setQueueUrlStatus(url, 'Failed');
 
 /** Count remaining queued urls, optionally by batch. */

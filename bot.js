@@ -984,7 +984,8 @@ const buildArticleMenuKeyboard = () => ({
         [{ text: '📤 Upload TXT / CSV', callback_data: 'home_wait:upload_txt' }],
         [{ text: '✍️ Paste URLs', callback_data: 'home_wait:paste_urls' }],
         [{ text: '📁 Scrape Folder', callback_data: 'home_action:scrape_folder' }],
-        [{ text: '🗂 Scrape Queue', callback_data: 'home_open:queue_menu' }],
+        [{ text: '🗂 Scrape Queue (Run All)', callback_data: 'queue_run_all' }],
+        [{ text: '🗂 Queue Menu', callback_data: 'home_open:queue_menu' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
 });
