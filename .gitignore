@@ -11,3 +11,4 @@ export_*.txt
 history.db
 .page_tracker_state.json
 rss/*.csv
+.claude/worktrees/
