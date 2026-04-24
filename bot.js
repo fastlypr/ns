@@ -51,7 +51,9 @@ import {
     deleteQueueBatch,
     purgeDoneFromQueue,
     purgeAlreadyScrapedFromQueue,
-    getQueuedUrls
+    getQueuedUrls,
+    urlExists,
+    removeQueuedUrl
 } from './db.js';
 
 // Utility function to escape MarkdownV2 special characters
@@ -3041,9 +3043,47 @@ bot.on('callback_query', async (callbackQuery) => {
             ? resolveQueueBatchIndex(data.slice('queue_run_batch:'.length))
             : null;
         await safeAnswerCallbackQuery(callbackQuery.id);
-        const urls = batchId ? getQueuedUrls({ batchId }) : getQueuedUrls({});
+
+        // Purge already-scraped URLs from the queue FIRST so we don't waste
+        // minutes (or hours) "skipping" 100k+ rows that are already in
+        // scraped_urls. This is a single SQL statement and completes in ms
+        // even on huge queues.
+        try {
+            const removed = purgeAlreadyScrapedFromQueue();
+            if (removed > 0) {
+                await sendPlainMessage(
+                    `🧹 Cleaned ${removed} already-scraped URL(s) from the queue before running.`,
+                    msg.chat.id
+                );
+            }
+        } catch (err) {
+            console.error(`Pre-scrape queue cleanup failed: ${err.message}`);
+        }
+
+        const rawUrls = batchId ? getQueuedUrls({ batchId }) : getQueuedUrls({});
+        // Defence in depth: the SQL purge above handles exact matches, but a
+        // legacy queue row whose URL normalizes differently (e.g. trailing
+        // slash vs none) can still slip through. Filter again via
+        // urlExists() which runs the URL through normalizeUrl() first, and
+        // delete the offending queue rows so they don't come back.
+        const urls = [];
+        let filtered = 0;
+        for (const u of rawUrls) {
+            if (urlExists(u)) {
+                removeQueuedUrl(u);
+                filtered++;
+            } else {
+                urls.push(u);
+            }
+        }
+        if (filtered > 0) {
+            await sendPlainMessage(
+                `🧹 Dropped ${filtered} more already-scraped URL(s) detected via fuzzy match.`,
+                msg.chat.id
+            );
+        }
         if (urls.length === 0) {
-            await sendPlainMessage('Queue is empty — nothing to scrape.', msg.chat.id);
+            await sendPlainMessage('Queue is empty — nothing new to scrape.', msg.chat.id);
             return;
         }
         const label = batchId ? `Queue:${batchId}` : 'Queue:All';
