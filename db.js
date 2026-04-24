@@ -413,7 +413,17 @@ export function enqueueUrls(urls, { source = 'unknown', batchId = null } = {}) {
     ));
 
     if (uniqueUrls.length === 0) {
-        return { inserted: 0, batchId: bid };
+        return { inserted: 0, batchId: bid, skippedAlreadyScraped: 0 };
+    }
+
+    // Skip URLs that are already in `scraped_urls` — they've been processed
+    // and should not be re-queued. Otherwise RSS pollers would keep re-adding
+    // the same URLs after `markQueueDone` deletes them from the queue.
+    const fresh = uniqueUrls.filter(u => !urlExists(u));
+    const skippedAlreadyScraped = uniqueUrls.length - fresh.length;
+
+    if (fresh.length === 0) {
+        return { inserted: 0, batchId: bid, skippedAlreadyScraped };
     }
 
     const tx = db.transaction((rows) => {
@@ -423,11 +433,11 @@ export function enqueueUrls(urls, { source = 'unknown', batchId = null } = {}) {
     });
 
     try {
-        tx(uniqueUrls);
-        return { inserted: uniqueUrls.length, batchId: bid };
+        tx(fresh);
+        return { inserted: fresh.length, batchId: bid, skippedAlreadyScraped };
     } catch (err) {
         console.error(`Database Error (Enqueue URLs): ${err.message}`);
-        return { inserted: 0, batchId: bid };
+        return { inserted: 0, batchId: bid, skippedAlreadyScraped };
     }
 }
 
@@ -504,6 +514,24 @@ export function purgeDoneFromQueue() {
         return deleteDoneStmt.run().changes;
     } catch (err) {
         console.error(`Database Error (Purge Done): ${err.message}`);
+        return 0;
+    }
+}
+
+/**
+ * One-shot cleanup: delete queue rows for URLs that are already in
+ * `scraped_urls`. Intended to run at startup to reconcile a queue that
+ * was filled before the enqueue-dedup logic was added.
+ */
+export function purgeAlreadyScrapedFromQueue() {
+    try {
+        const res = db.prepare(`
+            DELETE FROM queued_urls
+            WHERE url IN (SELECT url FROM scraped_urls)
+        `).run();
+        return res.changes;
+    } catch (err) {
+        console.error(`Database Error (Purge Already Scraped): ${err.message}`);
         return 0;
     }
 }

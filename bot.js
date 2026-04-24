@@ -50,6 +50,7 @@ import {
     countQueued,
     deleteQueueBatch,
     purgeDoneFromQueue,
+    purgeAlreadyScrapedFromQueue,
     getQueuedUrls
 } from './db.js';
 
@@ -1474,6 +1475,16 @@ const ingestLegacyToScrapeFolder = () => {
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 initializeScraper();
 ingestLegacyToScrapeFolder();
+// Reconcile queue with scrape history: drop any queued URLs that are
+// already in `scraped_urls`, so we don't burn time "Skipping" them.
+try {
+    const removed = purgeAlreadyScrapedFromQueue();
+    if (removed > 0) {
+        console.log(`🧹 Queue startup cleanup: removed ${removed} already-scraped URL(s) from the queue.`);
+    }
+} catch (err) {
+    console.error(`Queue startup cleanup failed: ${err.message}`);
+}
 startDownloadServer();
 bot.setMyCommands(BOT_COMMANDS).catch(error => {
     console.error(`Failed to set Telegram bot commands: ${error.message}`);
