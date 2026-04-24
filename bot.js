@@ -659,13 +659,25 @@ const sendOrEditMenu = async (chatId, text, replyMarkup, message = null) => {
             if (description.includes('message is not modified')) {
                 return;
             }
+            // Log other edit errors so we can diagnose silent button failures
+            // (e.g. BUTTON_DATA_INVALID from oversized callback_data).
+            console.error(`[sendOrEditMenu] editMessageText failed: ${description}`);
         }
     }
 
-    await bot.sendMessage(chatId, text, {
-        reply_markup: replyMarkup,
-        disable_web_page_preview: true
-    });
+    try {
+        await bot.sendMessage(chatId, text, {
+            reply_markup: replyMarkup,
+            disable_web_page_preview: true
+        });
+    } catch (error) {
+        const description = error?.response?.body?.description || error?.message || '';
+        console.error(`[sendOrEditMenu] sendMessage failed: ${description}`);
+        // Best-effort fallback: show the text alone so the user isn't stuck
+        try {
+            await bot.sendMessage(chatId, `⚠️ Menu render failed: ${description}\n\n${text}`);
+        } catch { /* give up */ }
+    }
 };
 
 const showHomeMenu = async (chatId, message = null) => {
@@ -982,28 +994,58 @@ const buildArticleMenuKeyboard = () => ({
  * "Run All Queued" pulls all Queued rows regardless of batch; per-batch buttons
  * filter to a single batch. Purge Done clears finished rows (safe — history
  * remains in `scraped_urls`).
+ *
+ * Batch IDs can be up to ~120 chars, but Telegram's callback_data hard limit
+ * is 64 bytes. We therefore expose each batch via a short numeric index and
+ * resolve the full ID via `queueBatchIndex` on click.
  */
+const queueBatchIndex = new Map(); // index (string) -> batch_id
+let queueBatchCounter = 0;
+
+const registerQueueBatchIndex = (batchId) => {
+    const id = (batchId == null ? '' : String(batchId));
+    // Reuse an existing short index if present
+    for (const [idx, bid] of queueBatchIndex.entries()) {
+        if (bid === id) return idx;
+    }
+    const idx = String(queueBatchCounter++);
+    queueBatchIndex.set(idx, id);
+    return idx;
+};
+
+const resolveQueueBatchIndex = (idx) => {
+    if (queueBatchIndex.has(idx)) return queueBatchIndex.get(idx);
+    // Back-compat: if the callback carries a raw batch id (short enough), use as-is
+    return idx;
+};
+
 const buildQueueMenuKeyboard = () => {
     const batches = listQueueBatches().slice(0, 10);
     const rows = [];
     const total = countQueued();
     rows.push([{ text: `▶️ Run All Queued (${total})`, callback_data: 'queue_run_all' }]);
     for (const b of batches) {
-        const label = `${b.queued ? '🟡' : (b.done ? '✅' : '⬜')} ${b.batch_id || '(no batch)'} — ${b.queued}/${b.total}`;
-        rows.push([{ text: label.slice(0, 64), callback_data: `queue_batch:${b.batch_id || ''}` }]);
+        const bid = b.batch_id || '';
+        const idx = registerQueueBatchIndex(bid);
+        const shown = bid ? (bid.length > 28 ? bid.slice(0, 25) + '…' : bid) : '(no batch)';
+        const label = `${b.queued ? '🟡' : (b.done ? '✅' : '⬜')} ${shown} — ${b.queued}/${b.total}`;
+        rows.push([{ text: label.slice(0, 64), callback_data: `queue_batch:${idx}` }]);
     }
     rows.push([{ text: '🧹 Purge Done', callback_data: 'queue_purge_done' }]);
     rows.push([{ text: '⬅️ Back to Home', callback_data: 'home_back' }]);
     return { inline_keyboard: rows };
 };
 
-const buildQueueBatchKeyboard = (batchId) => ({
-    inline_keyboard: [
-        [{ text: '▶️ Run This Batch', callback_data: `queue_run_batch:${batchId}` }],
-        [{ text: '🗑 Delete Batch',    callback_data: `queue_del_batch:${batchId}` }],
-        [{ text: '⬅️ Back to Queue',   callback_data: 'home_open:queue_menu' }]
-    ]
-});
+const buildQueueBatchKeyboard = (batchId) => {
+    const idx = registerQueueBatchIndex(batchId || '');
+    return {
+        inline_keyboard: [
+            [{ text: '▶️ Run This Batch', callback_data: `queue_run_batch:${idx}` }],
+            [{ text: '🗑 Delete Batch',    callback_data: `queue_del_batch:${idx}` }],
+            [{ text: '⬅️ Back to Queue',   callback_data: 'home_open:queue_menu' }]
+        ]
+    };
+};
 
 const buildXmlMenuKeyboard = () => ({
     inline_keyboard: [
@@ -2971,7 +3013,8 @@ bot.on('callback_query', async (callbackQuery) => {
     }
 
     if (data.startsWith('queue_batch:')) {
-        const batchId = data.slice('queue_batch:'.length);
+        const idx = data.slice('queue_batch:'.length);
+        const batchId = resolveQueueBatchIndex(idx);
         await safeAnswerCallbackQuery(callbackQuery.id);
         const b = listQueueBatches().find(x => (x.batch_id || '') === batchId);
         const text = b
@@ -2982,7 +3025,9 @@ bot.on('callback_query', async (callbackQuery) => {
     }
 
     if (data === 'queue_run_all' || data.startsWith('queue_run_batch:')) {
-        const batchId = data.startsWith('queue_run_batch:') ? data.slice('queue_run_batch:'.length) : null;
+        const batchId = data.startsWith('queue_run_batch:')
+            ? resolveQueueBatchIndex(data.slice('queue_run_batch:'.length))
+            : null;
         await safeAnswerCallbackQuery(callbackQuery.id);
         const urls = batchId ? getQueuedUrls({ batchId }) : getQueuedUrls({});
         if (urls.length === 0) {
@@ -2997,7 +3042,7 @@ bot.on('callback_query', async (callbackQuery) => {
     }
 
     if (data.startsWith('queue_del_batch:')) {
-        const batchId = data.slice('queue_del_batch:'.length);
+        const batchId = resolveQueueBatchIndex(data.slice('queue_del_batch:'.length));
         await safeAnswerCallbackQuery(callbackQuery.id);
         const removed = deleteQueueBatch(batchId);
         await sendPlainMessage(`🗑 Deleted ${removed} row(s) from batch ${batchId}.`, msg.chat.id);
