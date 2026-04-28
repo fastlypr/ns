@@ -51,6 +51,7 @@ import {
     deleteQueueBatch,
     purgeDoneFromQueue,
     purgeAlreadyScrapedFromQueue,
+    normalizeQueuedUrls,
     getQueuedUrls,
     urlExists,
     removeQueuedUrl
@@ -1477,6 +1478,18 @@ const ingestLegacyToScrapeFolder = () => {
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 initializeScraper();
 ingestLegacyToScrapeFolder();
+// Migrate legacy queue rows: rewrite each queued URL into its canonical
+// normalized form so the cheap SQL purge (next step) joins correctly
+// with `scraped_urls`. Also dedup any rows whose normalized form
+// collides with an existing queued URL.
+try {
+    const { rewritten, dropped } = normalizeQueuedUrls();
+    if (rewritten || dropped) {
+        console.log(`🧹 Queue normalization: rewrote ${rewritten} URL(s), dropped ${dropped} duplicate(s).`);
+    }
+} catch (err) {
+    console.error(`Queue normalization failed: ${err.message}`);
+}
 // Reconcile queue with scrape history: drop any queued URLs that are
 // already in `scraped_urls`, so we don't burn time "Skipping" them.
 try {
@@ -3159,11 +3172,26 @@ bot.on('callback_query', async (callbackQuery) => {
 
     if (data === 'home_open:queue_menu') {
         await safeAnswerCallbackQuery(callbackQuery.id);
+        // Auto-clean already-scraped URLs from the queue before rendering
+        // so the displayed count is accurate (not inflated by rows whose
+        // urls already live in scraped_urls).
+        let removedExisting = 0;
+        try {
+            removedExisting = purgeAlreadyScrapedFromQueue();
+        } catch (err) {
+            console.error(`Queue menu pre-render purge failed: ${err.message}`);
+        }
         const total = countQueued();
-        const header = total === 0
-            ? '🗂 Scrape Queue is empty.'
-            : `🗂 Scrape Queue — ${total} URL(s) pending across ${listQueueBatches().length} batch(es).`;
-        await sendOrEditMenu(msg.chat.id, header, buildQueueMenuKeyboard(), msg);
+        const headerLines = [];
+        if (removedExisting > 0) {
+            headerLines.push(`🧹 Auto-cleaned ${removedExisting} already-scraped URL(s).`);
+        }
+        headerLines.push(
+            total === 0
+                ? '🗂 Scrape Queue is empty.'
+                : `🗂 Scrape Queue — ${total} URL(s) pending across ${listQueueBatches().length} batch(es).`
+        );
+        await sendOrEditMenu(msg.chat.id, headerLines.join('\n'), buildQueueMenuKeyboard(), msg);
         return;
     }
 

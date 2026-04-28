@@ -519,21 +519,99 @@ export function purgeDoneFromQueue() {
 }
 
 /**
- * One-shot cleanup: delete queue rows for URLs that are already in
- * `scraped_urls`. Intended to run at startup to reconcile a queue that
- * was filled before the enqueue-dedup logic was added.
+ * One-shot cleanup: delete queue rows whose URL is already represented in
+ * `scraped_urls`. We do this in two passes:
+ *   1. Fast SQL pass — exact-match join. Catches the bulk in milliseconds.
+ *   2. Normalization pass — re-runs every remaining queue URL through
+ *      normalizeUrl() and checks scraped_urls. This catches legacy queue
+ *      rows whose stored form has drifted from current normalizeUrl
+ *      output (e.g. trailing slash, embedded www., upper-case host).
+ *
+ * Returns the total number of rows deleted.
  */
 export function purgeAlreadyScrapedFromQueue() {
+    let removed = 0;
+    // Pass 1: fast exact-match SQL.
     try {
         const res = db.prepare(`
             DELETE FROM queued_urls
             WHERE url IN (SELECT url FROM scraped_urls)
         `).run();
-        return res.changes;
+        removed += res.changes;
     } catch (err) {
-        console.error(`Database Error (Purge Already Scraped): ${err.message}`);
-        return 0;
+        console.error(`Database Error (Purge Already Scraped, pass 1): ${err.message}`);
     }
+
+    // Pass 2: fuzzy match via normalizeUrl. Iterates remaining queue rows.
+    // Uses a single transaction for the deletes so it's still fast on big queues.
+    try {
+        const remaining = db.prepare('SELECT url FROM queued_urls').all();
+        if (remaining.length > 0) {
+            const toDelete = [];
+            for (const row of remaining) {
+                const norm = normalizeUrl(row.url);
+                // If either the stored form or the re-normalized form is in scraped_urls, drop it.
+                if (norm !== row.url && checkStmt.get(norm)) {
+                    toDelete.push(row.url);
+                }
+            }
+            if (toDelete.length > 0) {
+                const tx = db.transaction((urls) => {
+                    for (const u of urls) deleteQueuedUrlStmt.run(u);
+                });
+                tx(toDelete);
+                removed += toDelete.length;
+            }
+        }
+    } catch (err) {
+        console.error(`Database Error (Purge Already Scraped, pass 2): ${err.message}`);
+    }
+
+    return removed;
+}
+
+/**
+ * Re-normalize every URL in `queued_urls`. If a row's url is not the
+ * canonical normalized form, replace it (or drop it if a row with the
+ * canonical form already exists). Returns { rewritten, dropped }.
+ *
+ * Intended as a one-shot startup migration. After it runs, the cheap
+ * SQL `WHERE url IN (SELECT url FROM scraped_urls)` join works correctly
+ * because both tables now use the same canonical form.
+ */
+export function normalizeQueuedUrls() {
+    let rewritten = 0;
+    let dropped = 0;
+    try {
+        const all = db.prepare('SELECT url, source, batch_id, status, discovered_at, updated_at FROM queued_urls').all();
+        const tx = db.transaction((rows) => {
+            for (const row of rows) {
+                const norm = normalizeUrl(row.url);
+                if (!norm || norm === row.url) continue;
+                // Drop the legacy row first.
+                deleteQueuedUrlStmt.run(row.url);
+                // If the normalized form already exists, we're done with this URL.
+                const exists = db.prepare('SELECT 1 FROM queued_urls WHERE url = ?').get(norm);
+                if (exists) {
+                    dropped++;
+                    continue;
+                }
+                // Otherwise reinsert with the canonical url.
+                upsertQueuedUrlStmt.run(
+                    norm,
+                    row.source || 'unknown',
+                    row.batch_id || null,
+                    row.discovered_at || new Date().toISOString(),
+                    row.updated_at || new Date().toISOString()
+                );
+                rewritten++;
+            }
+        });
+        tx(all);
+    } catch (err) {
+        console.error(`Database Error (Normalize Queue): ${err.message}`);
+    }
+    return { rewritten, dropped };
 }
 
 export function removeQueuedUrl(url) {
