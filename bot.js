@@ -54,7 +54,9 @@ import {
     normalizeQueuedUrls,
     getQueuedUrls,
     urlExists,
-    removeQueuedUrl
+    removeQueuedUrl,
+    DB_FILE_PATH,
+    closeDatabase
 } from './db.js';
 
 // Utility function to escape MarkdownV2 special characters
@@ -1149,6 +1151,8 @@ const buildSystemMenuKeyboard = () => ({
         [{ text: '📈 Statistics', callback_data: 'home_view:stats' }],
         [{ text: '🛡️ Proxy Mode', callback_data: 'home_open:proxy_mode' }],
         [{ text: '⬆️ Update & Restart', callback_data: 'home_action:deploy_update' }],
+        [{ text: '💾 Download DB', callback_data: 'home_action:db_download' }],
+        [{ text: '📥 Upload DB (Restore)', callback_data: 'home_wait:upload_db' }],
         [{ text: '❓ Help', callback_data: 'home_view:help' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
@@ -1680,6 +1684,101 @@ const downloadTelegramInputFile = async (document) => {
     }
 
     return finalPath;
+};
+
+/**
+ * Send the current SQLite DB file to Telegram so the user can keep an
+ * off-server backup or seed a fresh VM.
+ *
+ * Telegram bot API caps outgoing documents at 50 MB. If the DB exceeds
+ * that, we surface a clear message rather than failing silently.
+ */
+const sendDatabaseBackup = async (chatId) => {
+    try {
+        if (!fs.existsSync(DB_FILE_PATH)) {
+            await sendPlainMessage('No database file found on disk.', chatId);
+            return;
+        }
+        const stats = fs.statSync(DB_FILE_PATH);
+        const sizeMb = stats.size / (1024 * 1024);
+        if (stats.size > 50 * 1024 * 1024) {
+            await sendPlainMessage(
+                `Database is ${sizeMb.toFixed(1)} MB which exceeds Telegram's 50 MB upload limit.\n` +
+                'Use SCP/rsync from the server, or compress and split the file before downloading.',
+                chatId
+            );
+            return;
+        }
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        await bot.sendDocument(
+            chatId,
+            DB_FILE_PATH,
+            { caption: `💾 history.db backup\nSize: ${sizeMb.toFixed(2)} MB\nTaken: ${ts}` },
+            { filename: `history-${ts}.db`, contentType: 'application/x-sqlite3' }
+        );
+    } catch (err) {
+        console.error(`DB backup failed: ${err.message}`);
+        await sendPlainMessage(`❌ DB backup failed: ${err.message}`, chatId);
+    }
+};
+
+/**
+ * Replace the running history.db with an uploaded SQLite file.
+ * Steps:
+ *   1. Sanity-check the uploaded file (header + open trial).
+ *   2. Move current DB to history.db.bak.<ts> as a safety net.
+ *   3. Move uploaded file into place.
+ *   4. Close DB connection and exit (systemd restarts the service,
+ *      reopening the new DB at boot).
+ */
+const restoreDatabaseFromUpload = async (chatId, uploadedPath) => {
+    try {
+        // Quick sanity check: SQLite files start with the magic string
+        // "SQLite format 3\0" (16 bytes).
+        const fd = fs.openSync(uploadedPath, 'r');
+        const header = Buffer.alloc(16);
+        fs.readSync(fd, header, 0, 16, 0);
+        fs.closeSync(fd);
+        if (!header.toString('utf8').startsWith('SQLite format 3')) {
+            await sendPlainMessage('❌ Uploaded file is not a SQLite database (bad header).', chatId);
+            try { fs.unlinkSync(uploadedPath); } catch {}
+            return;
+        }
+
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const backupPath = `${DB_FILE_PATH}.bak.${ts}`;
+
+        await sendPlainMessage(
+            `📥 Restoring database…\n` +
+            `• Backing up current DB to: ${path.basename(backupPath)}\n` +
+            `• Replacing with uploaded file\n` +
+            `• Bot will exit; systemd will restart and open the new DB.`,
+            chatId
+        );
+
+        // 1. Close the current DB so we can move the file safely.
+        closeDatabase();
+
+        // 2. Back up the existing DB (if any).
+        if (fs.existsSync(DB_FILE_PATH)) {
+            fs.renameSync(DB_FILE_PATH, backupPath);
+        }
+
+        // 3. Move uploaded file into place.
+        fs.renameSync(uploadedPath, DB_FILE_PATH);
+
+        await sendPlainMessage(
+            `✅ Restore staged. Exiting now — service should restart in a few seconds.`,
+            chatId
+        );
+
+        // 4. Exit so systemd restarts the service with the new DB.
+        // Small delay so the message above has time to flush.
+        setTimeout(() => process.exit(0), 1500);
+    } catch (err) {
+        console.error(`DB restore failed: ${err.message}`);
+        await sendPlainMessage(`❌ DB restore failed: ${err.message}`, chatId);
+    }
 };
 
 const extractUrlsFromFile = (filePath) => {
@@ -2586,6 +2685,27 @@ bot.on('document', async (msg) => {
     const lowerFileName = fileName.toLowerCase();
     const pendingInput = getPendingChatInput(msg.chat.id);
 
+    // DB restore flow — must come before .txt/.csv gate.
+    if (pendingInput?.type === 'upload_db') {
+        clearPendingChatInput(msg.chat.id);
+        if (!lowerFileName.endsWith('.db') && !lowerFileName.endsWith('.sqlite') && !lowerFileName.endsWith('.sqlite3')) {
+            await sendPlainMessage('Please send a .db / .sqlite / .sqlite3 file for restore.', msg.chat.id);
+            return;
+        }
+        if (botStatus !== 'idle') {
+            await sendPlainMessage(`Bot is busy with '${botStatus}'. Stop the task first, then upload again.`, msg.chat.id);
+            return;
+        }
+        try {
+            const downloadedPath = await downloadTelegramInputFile(msg.document);
+            await restoreDatabaseFromUpload(msg.chat.id, downloadedPath);
+        } catch (err) {
+            console.error(`DB upload handling failed: ${err.message}`);
+            await sendPlainMessage(`❌ DB upload failed: ${err.message}`, msg.chat.id);
+        }
+        return;
+    }
+
     if (!lowerFileName.endsWith('.txt') && !lowerFileName.endsWith('.csv')) {
         if (
             pendingInput?.type === 'upload_txt' ||
@@ -3428,6 +3548,40 @@ bot.on('callback_query', async (callbackQuery) => {
     if (data === 'home_action:deploy_update') {
         await safeAnswerCallbackQuery(callbackQuery.id);
         await runDeployUpdate(msg.chat.id, msg);
+        return;
+    }
+
+    if (data === 'home_action:db_download') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendDatabaseBackup(msg.chat.id);
+        return;
+    }
+
+    if (data === 'home_wait:upload_db') {
+        // Refuse if a task is running — restoring would cut it off mid-flight.
+        if (botStatus !== 'idle') {
+            await safeAnswerCallbackQuery(callbackQuery.id, {
+                text: `Bot is busy with '${botStatus}'. Stop the task first.`,
+                show_alert: true
+            });
+            return;
+        }
+        setPendingChatInput(msg.chat.id, { type: 'upload_db' });
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await showHomeInfoPage(
+            msg.chat.id,
+            '📥 Upload DB (Restore)',
+            [
+                'Send a `history.db` SQLite file as a Telegram document.',
+                '',
+                '⚠️  This will REPLACE the current database.',
+                '⚠️  A backup of the existing DB will be saved as `history.db.bak.<timestamp>`.',
+                '⚠️  After restore the bot will exit and systemd will restart it.',
+                '',
+                'Telegram bot API limits incoming documents to ~20 MB.'
+            ],
+            msg
+        );
         return;
     }
 

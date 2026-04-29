@@ -5,6 +5,22 @@ import path from 'path';
 const DB_PATH = path.join(process.cwd(), 'history.db');
 const db = new Database(DB_PATH);
 
+/** Path to the SQLite file (used by the Telegram backup/restore feature). */
+export const DB_FILE_PATH = DB_PATH;
+
+/**
+ * Close the SQLite connection. Used by the Telegram restore flow before
+ * swapping `history.db` with an uploaded file. Caller is expected to
+ * exit the process afterwards (systemd will restart with the new DB).
+ */
+export function closeDatabase() {
+    try {
+        db.close();
+    } catch (err) {
+        console.error(`Database close error: ${err.message}`);
+    }
+}
+
 // Initialize Database
 db.exec(`
     CREATE TABLE IF NOT EXISTS scraped_urls (
