@@ -2343,7 +2343,21 @@ const runPageTrackerFlow = async (chatId = null, trigger = 'manual', trackedPage
 
     if (botStatus !== 'idle') {
         if (chatId) {
-            await sendPlainMessage('A main scraping task is running. Try Page Tracker again when it finishes.', chatId);
+            await sendPlainMessage(`Bot is busy with '${botStatus}'. Page Tracker will retry on the next interval.`, chatId);
+        } else {
+            console.log(`[PageTracker] Skipped (${trigger}): bot busy with '${botStatus}'.`);
+        }
+        return null;
+    }
+
+    // Don't slip into the brief gap between the auto-sitemap rescan and
+    // its subsequent queue-drain phase. The cycle-in-progress flag spans
+    // both phases.
+    if (autoSitemapCycleInProgress) {
+        if (chatId) {
+            await sendPlainMessage('Auto-sitemap cycle is running. Page Tracker will retry on the next interval.', chatId);
+        } else {
+            console.log(`[PageTracker] Skipped (${trigger}): auto-sitemap cycle in progress.`);
         }
         return null;
     }
@@ -2359,7 +2373,11 @@ const runPageTrackerFlow = async (chatId = null, trigger = 'manual', trackedPage
         return null;
     }
 
+    // Wrap the actual work in withBotStatus so botStatus !== 'idle' while
+    // we run. This makes the auto-sitemap cycle and any manual scrape
+    // request defer until the page tracker finishes — strict serialization.
     return runAuxTask('page_tracker', 'Page Tracker', async () => {
+        return withBotStatus('page_tracker', `page_tracker:${trigger}`, async () => {
         pageTrackerRunInProgress = true;
         let trackerMessage = null;
         let lastTrackerUpdateAt = 0;
@@ -2416,6 +2434,7 @@ const runPageTrackerFlow = async (chatId = null, trigger = 'manual', trackedPage
         } finally {
             pageTrackerRunInProgress = false;
         }
+        }); // end withBotStatus
     });
 };
 
@@ -2460,6 +2479,10 @@ const runAutoSitemapCycle = async (trigger = 'scheduled') => {
     }
     if (botStatus !== 'idle') {
         console.log(`[AutoSitemap] Cycle skipped (${trigger}): bot busy with '${botStatus}'. Will retry next interval.`);
+        return;
+    }
+    if (pageTrackerRunInProgress) {
+        console.log(`[AutoSitemap] Cycle skipped (${trigger}): page tracker is running. Will retry next interval.`);
         return;
     }
 
