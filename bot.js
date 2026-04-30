@@ -1591,7 +1591,79 @@ const safeEditMessageText = async (chatId, messageId, text) => {
     }
 };
 
+/**
+ * Wrap a Telegram handler with chat-id authorisation. Drops 17 copies
+ * of the inline `if (chatId !== TELEGRAM_CHAT_ID) { sendMessage('Unauthorized'); return }`
+ * boilerplate.
+ *
+ * Works for /command handlers (`msg`), document handlers (`msg`), plain
+ * message handlers (`msg`), and callback_query handlers (where
+ * `callbackQuery.message.chat.id` is the chat).
+ */
+const auth = (handler) => async (...args) => {
+    const first = args[0];
+    const chatId = first?.chat?.id ?? first?.message?.chat?.id ?? null;
+    if (chatId == null || String(chatId) !== String(TELEGRAM_CHAT_ID)) {
+        if (chatId != null) {
+            try { await bot.sendMessage(chatId, 'Unauthorized access.'); } catch { /* ignore */ }
+        }
+        return undefined;
+    }
+    return handler(...args);
+};
+
 const LIVE_TRACKER_INTERVAL_MS = 10 * 1000;
+
+/**
+ * Live-tracker helper. Replaces the inline trackerMessage/lastTrackerUpdateAt/
+ * try-edit-then-fallback pattern that was duplicated in
+ * runFileScrape, runFolderScrape, runTrackedUrlListScrape, runRetryScrape,
+ * runSitemapRescanFlow, runPageTrackerFlow, etc.
+ *
+ * Usage:
+ *   const tracker = await createLiveTracker(chatId, () => buildText(state));
+ *   await tracker.update(() => buildText(state));            // throttled
+ *   await tracker.update(() => buildText(state), true);      // force flush
+ *
+ * Edit failures fall back to a fresh message; the next edit targets the
+ * new message_id automatically.
+ *
+ * Returns an object {update, message} where `message` is the most-recent
+ * Telegram message object (in case caller needs message_id later).
+ */
+const createLiveTracker = async (chatId, render, { intervalMs = LIVE_TRACKER_INTERVAL_MS } = {}) => {
+    let trackerMessage = await sendPlainMessage(render(), chatId);
+    let lastUpdateAt = 0;
+
+    const update = async (renderFn = render, force = false) => {
+        const now = Date.now();
+        if (!force && now - lastUpdateAt < intervalMs) {
+            return;
+        }
+        lastUpdateAt = now;
+        const text = typeof renderFn === 'function' ? renderFn() : String(renderFn);
+
+        if (!trackerMessage || !trackerMessage.message_id) {
+            trackerMessage = await sendPlainMessage(text, chatId);
+            return;
+        }
+        try {
+            await safeEditMessageText(chatId, trackerMessage.message_id, text);
+        } catch (error) {
+            // Edit failed — usually rate-limited or message-too-old. Fall
+            // back to sending a new tracker message so the user keeps seeing
+            // progress. Subsequent edits target the new message id.
+            console.error(`[Tracker] Edit failed, falling back to new message: ${error?.message || error}`);
+            trackerMessage = await sendPlainMessage(text, chatId);
+        }
+    };
+
+    return {
+        update,
+        get message() { return trackerMessage; },
+        get messageId() { return trackerMessage?.message_id; }
+    };
+};
 
 const pendingChatInputs = new Map();
 
@@ -2576,12 +2648,7 @@ notifyDeployStatusIfPresent().catch(error => {
 });
 
 // Handle /start command
-bot.onText(/\/start/, (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/start/, auth((msg) => {
     clearPendingChatInput(msg.chat.id);
     clearPendingTrackedPageAdd(msg.chat.id);
     showHomeMenu(msg.chat.id);
@@ -2589,24 +2656,13 @@ bot.onText(/\/start/, (msg) => {
     bot.setMyCommands(BOT_COMMANDS).catch(error => {
         console.error(`Failed to set Telegram bot commands: ${error.message}`);
     });
-});
+}));
 
-bot.onText(/\/help/, (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/help/, auth((msg) => {
     bot.sendMessage(msg.chat.id, buildHelpMessage(), { parse_mode: 'MarkdownV2' });
-});
+}));
 
-bot.onText(/^\/stop$/, async (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
-
+bot.onText(/^\/stop$/, auth(async (msg) => {
     if (!currentAbortController || currentAbortController.signal.aborted) {
         await bot.sendMessage(
             msg.chat.id,
@@ -2623,15 +2679,9 @@ bot.onText(/^\/stop$/, async (msg) => {
         msg.chat.id,
         `🛑 Stop requested. The current task (${stoppedTask}) will halt after finishing any in-flight URLs. A final summary will follow shortly.`
     );
-});
+}));
 
-bot.onText(/\/status/, (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
-
+bot.onText(/\/status/, auth((msg) => {
     const status = getBotStatus();
     const auxTaskSummary = status.auxTasks.length === 0
         ? 'None'
@@ -2641,14 +2691,9 @@ bot.onText(/\/status/, (msg) => {
     sendMessage(
         `*Bot Status:* ${escapeMarkdownV2(status.status)}\n*Current Task:* ${escapeMarkdownV2(status.task || 'None')}\n*Other Tasks:* ${escapeMarkdownV2(auxTaskSummary)}\n*Page Tracker:* ${escapeMarkdownV2(trackerSchedule.enabled ? `Every ${trackerSchedule.intervalHours} hour${trackerSchedule.intervalHours === 1 ? '' : 's'}` : 'Paused')}`
     );
-});
+}));
 
-bot.onText(/\/scrape_url (.+)/, async (msg, match) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/scrape_url (.+)/, auth(async (msg, match) => {
     const url = match[1];
     const safeUrl = escapeMarkdownV2(url);
     await withBotStatus('scraping', `single_url:${url}`, async () => {
@@ -2656,24 +2701,13 @@ bot.onText(/\/scrape_url (.+)/, async (msg, match) => {
         await scrapeSingleUrlAndProcess(url);
         sendMessage('*Single URL scraping complete!*');
     });
-});
+}));
 
-bot.onText(/\/scrape_file/, async (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/scrape_file/, auth(async (msg) => {
     await showScrapeFileSelectionMenu(msg.chat.id);
-});
+}));
 
-bot.on('document', async (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
-
+bot.on('document', auth(async (msg) => {
     const fileName = path.basename(msg.document?.file_name || '');
     const lowerFileName = fileName.toLowerCase();
     const pendingInput = getPendingChatInput(msg.chat.id);
@@ -2749,11 +2783,10 @@ bot.on('document', async (msg) => {
         console.error(`Failed to handle Telegram document: ${error.message}`);
         await sendPlainMessage('Failed to download or process the uploaded file.', msg.chat.id);
     }
-});
+}));
 
-bot.on('message', async (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized || !msg.text || msg.text.startsWith('/')) {
+bot.on('message', auth(async (msg) => {
+    if (!msg.text || msg.text.startsWith('/')) {
         return;
     }
 
@@ -2958,9 +2991,12 @@ bot.on('message', async (msg) => {
     await withBotStatus('scraping', `telegram_input:${urls.length}`, async () => {
         await runTrackedUrlListScrape(msg.chat.id, 'Telegram Input', urls);
     });
-});
+}));
 
 bot.on('callback_query', async (callbackQuery) => {
+    // Callback queries need a custom auth path: instead of silently
+    // dropping, we answer the callback so Telegram doesn't show the
+    // perpetual loading spinner on the unauthorized client.
     const msg = callbackQuery.message;
     const data = callbackQuery.data || '';
     const isAuthorized = msg && msg.chat && msg.chat.id.toString() === TELEGRAM_CHAT_ID;
@@ -3952,12 +3988,7 @@ bot.on('callback_query', async (callbackQuery) => {
     await safeAnswerCallbackQuery(callbackQuery.id); // Acknowledge the callback query
 });
 
-bot.onText(/\/scrape_folder/, async (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/scrape_folder/, auth(async (msg) => {
     const toScrapeDir = path.join(process.cwd(), 'to scrape');
     if (!fs.existsSync(toScrapeDir)) {
         fs.mkdirSync(toScrapeDir);
@@ -3965,41 +3996,26 @@ bot.onText(/\/scrape_folder/, async (msg) => {
     await withBotStatus('scraping', 'folder', async () => {
         await runTrackedFolderScrape(msg.chat.id, toScrapeDir);
     });
-});
+}));
 
-bot.onText(/\/sitemap (.+)/, async (msg, match) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/sitemap (.+)/, auth(async (msg, match) => {
     const sitemapUrl = match[1];
     await withBotStatus('sitemap', `single:${sitemapUrl}`, async () => {
         sendMessage(`*Scraping sitemap:* ${escapeMarkdownV2(sitemapUrl)}`);
         const result = await runSitemapScraper(sitemapUrl);
         sendMessage(`*Sitemap scraping complete!*\nTotal URLs found: ${result.totalUrlsFound}\nNew URLs saved: ${result.newUrlsSaved}`);
     });
-});
+}));
 
-bot.onText(/\/sitemap_bulk/, async (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/sitemap_bulk/, auth(async () => {
     await withBotStatus('sitemap_bulk', 'bulk_sitemap', async () => {
         sendMessage(`*Starting bulk sitemap scraping from sitemaps.txt...*`);
         await runBulkSitemapScraper();
         sendMessage('*Bulk sitemap scraping complete!*');
     });
-});
+}));
 
-bot.onText(/\/sitemap_rescan(?: (.+))?/, async (msg, match) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/sitemap_rescan(?: (.+))?/, auth(async (msg, match) => {
     const targetDomain = match[1];
 
     if (targetDomain) {
@@ -4018,35 +4034,19 @@ bot.onText(/\/sitemap_rescan(?: (.+))?/, async (msg, match) => {
         'Select which sitemap group to rescan:',
         buildSitemapRescanKeyboard()
     );
-});
+}));
 
-bot.onText(/\/stats/, (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/stats/, auth(() => {
     const historyCount = getHistoryCount();
     sendMessage(`*Scraping Statistics:*\nTotal URLs processed: ${historyCount}`);
-});
+}));
 
-bot.onText(/\/download_results/, async (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
-
+bot.onText(/\/download_results/, auth(async (msg) => {
     clearResultsViewState(msg.chat.id);
     await showResultsRootMenu(msg.chat.id);
-});
+}));
 
-bot.onText(/\/export_urls (.+)/, async (msg, match) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/export_urls (.+)/, auth(async (msg, match) => {
     const status = match[1];
     sendMessage(`*Exporting URLs with status:* ${escapeMarkdownV2(status)}...`);
     const filePath = exportUrlsByStatus(status);
@@ -4055,16 +4055,11 @@ bot.onText(/\/export_urls (.+)/, async (msg, match) => {
     } else {
         sendMessage(`*Export failed or no URLs found for status:* ${escapeMarkdownV2(status)}`);
     }
-});
+}));
 
-bot.onText(/\/retry_failed/, async (msg) => {
-    const isAuthorized = msg.chat.id.toString() === TELEGRAM_CHAT_ID;
-    if (!isAuthorized) {
-        bot.sendMessage(msg.chat.id, 'Unauthorized access.');
-        return;
-    }
+bot.onText(/\/retry_failed/, auth(async (msg) => {
     await sendOrEditMenu(msg.chat.id, 'Choose which URLs to retry:', buildRetryTypeKeyboard());
-});
+}));
 
 console.log('Telegram Bot started...');
 
