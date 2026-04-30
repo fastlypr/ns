@@ -8,6 +8,14 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import {
+    parseCsvLine,
+    escapeCsvCell,
+    serializeCsvLine,
+    extractUrlsFromText as extractUrlsFromTextUtil,
+    requireAuth,
+    buildProgressText
+} from './utils.js';
+import {
     scrapeSingleUrlAndProcess,
     scrapeUrlsFromInputFile,
     runScraper,
@@ -442,46 +450,8 @@ const buildFolderFilesKeyboard = (folderName) => {
     return { inline_keyboard: inlineKeyboard };
 };
 
-const parseCsvLine = (line) => {
-    const values = [];
-    let current = '';
-    let inQuotes = false;
-
-    for (let i = 0; i < line.length; i++) {
-        const char = line[i];
-
-        if (char === '"') {
-            if (inQuotes && line[i + 1] === '"') {
-                current += '"';
-                i++;
-            } else {
-                inQuotes = !inQuotes;
-            }
-            continue;
-        }
-
-        if (char === ',' && !inQuotes) {
-            values.push(current);
-            current = '';
-            continue;
-        }
-
-        current += char;
-    }
-
-    values.push(current);
-    return values;
-};
-
-const escapeCsvCell = (value) => {
-    const stringValue = value === null || value === undefined ? '' : String(value);
-    if (/[",\n]/.test(stringValue)) {
-        return `"${stringValue.replace(/"/g, '""')}"`;
-    }
-    return stringValue;
-};
-
-const serializeCsvLine = (values) => values.map(escapeCsvCell).join(',');
+// CSV / URL / auth helpers moved to utils.js to avoid drift between bot.js and scraper.js.
+// (Imported via the shared `import` block at the top of this file.)
 
 const rewriteCsvFile = (filePath, transformRows) => {
     if (!fs.existsSync(filePath)) return;

@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { runSitemapScraper, rescanSavedSitemaps, runBulkSitemapScraper, runSitemapScraperCLI } from './xml.js';
 import { logScrapeResult, urlExists, getHistoryCount, getUrlsByStatus, exportUrlsByStatus, getDomainVariable, saveSocialLead, removeQueuedUrl, getQueuedUrls, markQueueScraping, markQueueDone, markQueueFailed } from './db.js';
+import { parseCsvLine, escapeCsvCell, serializeCsvLine } from './utils.js';
 
 // Configuration
 const TIMEOUT = 15000; // 15 seconds
@@ -743,46 +744,7 @@ function saveResults(result) {
     const day = now.getDate();
     const timestamp = `${month} ${day}`;
 
-    const parseCsvLine = (line) => {
-        const values = [];
-        let current = '';
-        let inQuotes = false;
-
-        for (let i = 0; i < line.length; i++) {
-            const char = line[i];
-
-            if (char === '"') {
-                if (inQuotes && line[i + 1] === '"') {
-                    current += '"';
-                    i++;
-                } else {
-                    inQuotes = !inQuotes;
-                }
-                continue;
-            }
-
-            if (char === ',' && !inQuotes) {
-                values.push(current);
-                current = '';
-                continue;
-            }
-
-            current += char;
-        }
-
-        values.push(current);
-        return values;
-    };
-
-    const escapeCsvCell = (value) => {
-        const stringValue = value === null || value === undefined ? '' : String(value);
-        if (/[",\n]/.test(stringValue)) {
-            return `"${stringValue.replace(/"/g, '""')}"`;
-        }
-        return stringValue;
-    };
-
-    const serializeCsvLine = (values) => values.map(escapeCsvCell).join(',');
+    // CSV helpers come from shared utils.js (imported at the top of this file).
 
     const ensureCsvColumn = (filePath, columnName) => {
         if (!fs.existsSync(filePath)) return;
