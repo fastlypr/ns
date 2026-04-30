@@ -10,10 +10,7 @@ import { promisify } from 'util';
 import {
     parseCsvLine,
     escapeCsvCell,
-    serializeCsvLine,
-    extractUrlsFromText as extractUrlsFromTextUtil,
-    requireAuth,
-    buildProgressText
+    serializeCsvLine
 } from './utils.js';
 import {
     scrapeSingleUrlAndProcess,

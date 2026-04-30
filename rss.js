@@ -46,7 +46,17 @@ function escapeRegex(value) {
     return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function normalizeUrl(inputUrl, baseUrl, keepQueryString = false) {
+/**
+ * Resolve a possibly-relative URL against a base, then strip fragment,
+ * credentials, and (optionally) the query string. Used during RSS / HTML
+ * parsing where href values can be relative.
+ *
+ * NB: this is NOT the same as db.js's `normalizeUrl(url)`. That one is
+ * the canonical storage normaliser (lower-cases host, strips `www.`,
+ * strips query, etc.) and must match exactly what's in the DB. Don't
+ * merge them.
+ */
+function resolveAndCleanUrl(inputUrl, baseUrl, keepQueryString = false) {
     const u = new URL(inputUrl, baseUrl);
     u.hash = '';
     if (!keepQueryString) u.search = '';
@@ -176,7 +186,7 @@ function getMediumPublicationFeedInfo(pageUrl) {
 
         return {
             publicationSlug,
-            originalUrl: normalizeUrl(pageUrl, pageUrl, true),
+            originalUrl: resolveAndCleanUrl(pageUrl, pageUrl, true),
             feedUrl: `https://medium.com/feed/${publicationSlug}`
         };
     } catch {
@@ -249,7 +259,7 @@ function extractFeedRowsFromXml(xml, startUrl, keepQueryString, sourcePath) {
     for (const item of [...rssItems, ...atomEntries]) {
         try {
             rows.push({
-                url: normalizeUrl(item.link, startUrl, keepQueryString),
+                url: resolveAndCleanUrl(item.link, startUrl, keepQueryString),
                 publishedAt: item.publishedAt,
                 sourcePaths: new Set([sourcePath])
             });
@@ -274,7 +284,7 @@ function extractMediumJsonRows(rawText, publicationSlug, sourcePath) {
 
     for (const matchedUrl of matches) {
         try {
-            const normalized = normalizeUrl(matchedUrl, matchedUrl, false);
+            const normalized = resolveAndCleanUrl(matchedUrl, matchedUrl, false);
             if (!uniqueRows.has(normalized)) {
                 uniqueRows.set(normalized, {
                     url: normalized,
@@ -457,7 +467,7 @@ export async function extractTrackedPageUrlsFromSitemap(sitemapUrl, options = {}
         if (pageUrls.length > 0) {
             for (const rawUrl of pageUrls) {
                 try {
-                    discoveredUrls.add(normalizeUrl(rawUrl, url, false));
+                    discoveredUrls.add(resolveAndCleanUrl(rawUrl, url, false));
                 } catch {
                 }
             }
@@ -476,7 +486,7 @@ export async function extractTrackedPageUrlsFromSitemap(sitemapUrl, options = {}
 
         for (const nestedUrl of nestedSitemaps) {
             try {
-                await fetchSitemap(normalizeUrl(nestedUrl, url, true), depth + 1);
+                await fetchSitemap(resolveAndCleanUrl(nestedUrl, url, true), depth + 1);
             } catch {
             }
         }
@@ -696,7 +706,7 @@ function extractEntriesFromJsonLd($, pageUrl, keepQueryString) {
             for (const c of collected) {
                 let abs;
                 try {
-                    abs = normalizeUrl(c.url, pageUrl, keepQueryString);
+                    abs = resolveAndCleanUrl(c.url, pageUrl, keepQueryString);
                 } catch {
                     continue;
                 }
@@ -732,7 +742,7 @@ export function extractArticleEntriesFromHtml(html, pageUrl, options) {
 
         let absolute;
         try {
-            absolute = normalizeUrl(rawHref, pageUrl, keepQueryString);
+            absolute = resolveAndCleanUrl(rawHref, pageUrl, keepQueryString);
         } catch {
             return;
         }
@@ -785,19 +795,19 @@ export function extractArticleEntriesFromHtml(html, pageUrl, options) {
 export function extractNextPageUrlFromHtml(html, currentUrl) {
     const $ = cheerio.load(html);
     const relNext = $('a[rel="next"]').attr('href') || $('link[rel="next"]').attr('href');
-    if (relNext) return normalizeUrl(relNext, currentUrl, true);
+    if (relNext) return resolveAndCleanUrl(relNext, currentUrl, true);
 
     const ariaNext = $('a[aria-label*="Next"], a[aria-label*="next"]').first().attr('href');
-    if (ariaNext) return normalizeUrl(ariaNext, currentUrl, true);
+    if (ariaNext) return resolveAndCleanUrl(ariaNext, currentUrl, true);
 
     const classNext = $('a.next, a.next.page-numbers, li.next a').first().attr('href');
-    if (classNext) return normalizeUrl(classNext, currentUrl, true);
+    if (classNext) return resolveAndCleanUrl(classNext, currentUrl, true);
 
     const textNext = $('a')
         .filter((_, el) => ($(el).text() || '').trim().toLowerCase() === 'next')
         .first()
         .attr('href');
-    if (textNext) return normalizeUrl(textNext, currentUrl, true);
+    if (textNext) return resolveAndCleanUrl(textNext, currentUrl, true);
 
     return null;
 }

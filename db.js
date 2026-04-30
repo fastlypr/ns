@@ -457,11 +457,6 @@ export function enqueueUrls(urls, { source = 'unknown', batchId = null } = {}) {
     }
 }
 
-/** Backward-compat wrapper for older callers. */
-export function saveQueuedUrls(urls, source = 'unknown') {
-    return enqueueUrls(urls, { source }).inserted;
-}
-
 /**
  * Returns URLs in 'Queued' status, optionally filtered by batch.
  * @param {{ batchId?: string|null }} [opts]

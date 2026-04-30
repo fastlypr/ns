@@ -6,7 +6,7 @@ import zlib from 'zlib';
 import http from 'http';
 import https from 'https';
 import { promisify } from 'util';
-import { normalizeUrl, getAllScrapedUrls, getAllQueuedUrls, saveQueuedUrls, enqueueUrls, makeBatchId, saveDiscoveredSitemap, getAllSitemaps, updateSitemapScanDate } from './db.js';
+import { normalizeUrl, getAllScrapedUrls, getAllQueuedUrls, enqueueUrls, makeBatchId, saveDiscoveredSitemap, getAllSitemaps, updateSitemapScanDate } from './db.js';
 
 const gunzip = promisify(zlib.gunzip);
 
