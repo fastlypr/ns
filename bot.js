@@ -1116,6 +1116,8 @@ const buildResultsMenuKeyboard = () => ({
         [{ text: '📂 Download Results', callback_data: 'home_open:download_results' }],
         [{ text: '🧩 Domain Variable', callback_data: 'home_open:domain_variables' }],
         [{ text: '📤 Export URLs', callback_data: 'home_usage:export_urls' }],
+        [{ text: '📊 Coverage Export', callback_data: 'home_open:coverage_menu' }],
+        [{ text: '🚫 No-Result Export', callback_data: 'home_open:noresult_menu' }],
         [{ text: '♻️ Retry URLs', callback_data: 'home_open:retry_menu' }],
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
@@ -1133,6 +1135,211 @@ const buildSystemMenuKeyboard = () => ({
         [{ text: '⬅️ Back to Home', callback_data: 'home_back' }]
     ]
 });
+
+/* -------------------------------------------------------------------- *
+ *  Coverage Export + No-Result Export menu builders & helpers
+ * -------------------------------------------------------------------- */
+
+// Telegram callback_data is capped at 64 bytes. Domain names can run
+// long (e.g. some long subdomain), so we register each domain in a
+// short-id index per chat and look it back up on click. Same pattern
+// as the queue batch index.
+const coverageDomainIndex = new Map(); // index -> domain
+let coverageDomainCounter = 0;
+const registerCoverageDomain = (domain) => {
+    const d = String(domain || '');
+    for (const [idx, val] of coverageDomainIndex.entries()) {
+        if (val === d) return idx;
+    }
+    const idx = String(coverageDomainCounter++);
+    coverageDomainIndex.set(idx, d);
+    return idx;
+};
+const resolveCoverageDomain = (idx) => coverageDomainIndex.get(idx) ?? null;
+
+const formatNum = (n) => Number(n || 0).toLocaleString('en-US');
+
+const buildCoverageMenuKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '📥 Instagram only → CSV', callback_data: 'cov_pick:ig_only' }],
+        [{ text: '📥 LinkedIn only → CSV',  callback_data: 'cov_pick:li_only' }],
+        [{ text: '📥 Neither found → CSV',   callback_data: 'cov_pick:neither' }],
+        [{ text: '⬅️ Back', callback_data: 'home_section:results' }]
+    ]
+});
+
+const buildCoverageHeader = () => {
+    const s = getCoverageSummary({ sourceType: 'page_tracker' });
+    const lines = [
+        '📊 Coverage Export — Page Tracker URLs',
+        '',
+        `Successful articles: ${formatNum(s.total_success)}`,
+        `├─ Instagram only (need LinkedIn):  ${formatNum(s.ig_only)}`,
+        `├─ LinkedIn only (need Instagram): ${formatNum(s.li_only)}`,
+        `├─ Both already found:             ${formatNum(s.both)}`,
+        `└─ Neither found:                  ${formatNum(s.neither)}`,
+        '',
+        'Pick a coverage gap to export.',
+        'XML/sitemap & legacy URLs are excluded by design.'
+    ];
+    return lines.join('\n');
+};
+
+const buildCoverageDomainKeyboard = (bucket, page = 0) => {
+    const all = getCoverageBreakdownByDomain(bucket, { sourceType: 'page_tracker' });
+    const total = all.reduce((acc, r) => acc + r.n, 0);
+    const PAGE_SIZE = 10;
+    const slice = all.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+
+    const rows = [];
+    rows.push([{
+        text: `🌐 All Domains (${formatNum(total)})`,
+        callback_data: `cov_export:${bucket}:all`
+    }]);
+    for (const row of slice) {
+        const idx = registerCoverageDomain(row.domain);
+        rows.push([{
+            text: `${row.domain.slice(0, 32)} (${formatNum(row.n)})`,
+            callback_data: `cov_export:${bucket}:${idx}`
+        }]);
+    }
+    const navRow = [];
+    if (page > 0) navRow.push({ text: '◀ Prev', callback_data: `cov_page:${bucket}:${page - 1}` });
+    if ((page + 1) * PAGE_SIZE < all.length) navRow.push({ text: 'Next ▶', callback_data: `cov_page:${bucket}:${page + 1}` });
+    if (navRow.length > 0) rows.push(navRow);
+    rows.push([{ text: '⬅️ Back', callback_data: 'home_open:coverage_menu' }]);
+    return { inline_keyboard: rows };
+};
+
+const COVERAGE_BUCKET_LABEL = {
+    ig_only: 'Instagram only',
+    li_only: 'LinkedIn only',
+    neither: 'Neither found'
+};
+
+const buildNoResultMenuKeyboard = () => {
+    const s = getNoResultSummary();
+    return {
+        inline_keyboard: [
+            [{ text: `📥 All sources (${formatNum(s.total)})`,            callback_data: 'nores_pick:all' }],
+            [{ text: `📥 Page Tracker only (${formatNum(s.page_tracker)})`, callback_data: 'nores_pick:page_tracker' }],
+            [{ text: `📥 Sitemap only (${formatNum(s.sitemap)})`,         callback_data: 'nores_pick:sitemap' }],
+            [{ text: `📥 Manual / Legacy (${formatNum(s.manual + s.legacy)})`, callback_data: 'nores_pick:manual_legacy' }],
+            [{ text: '⬅️ Back', callback_data: 'home_section:results' }]
+        ]
+    };
+};
+
+const buildNoResultHeader = () => {
+    const s = getNoResultSummary();
+    return [
+        '🚫 No-Result Export',
+        '',
+        `Total No-Result articles: ${formatNum(s.total)}`,
+        `├─ From Page Tracker:    ${formatNum(s.page_tracker)}`,
+        `├─ From Sitemap:         ${formatNum(s.sitemap)}`,
+        `├─ Manual:               ${formatNum(s.manual)}`,
+        `└─ Legacy (pre-tagging): ${formatNum(s.legacy)}`,
+        '',
+        'Pick which scope to export.'
+    ].join('\n');
+};
+
+// Encode the no-result source pick as a single token for callbacks.
+const NORES_SOURCE_TYPE = {
+    all: null,
+    page_tracker: 'page_tracker',
+    sitemap: 'sitemap',
+    manual_legacy: 'manual_legacy' // special: filter for source_type IN ('manual','legacy')
+};
+
+const buildNoResultDomainKeyboard = (sourceKey, page = 0) => {
+    const sourceType = sourceKey === 'all' ? null
+                     : sourceKey === 'manual_legacy' ? null  // applied client-side below
+                     : NORES_SOURCE_TYPE[sourceKey];
+    let all = getNoResultBreakdownByDomain({ sourceType });
+    if (sourceKey === 'manual_legacy') {
+        // Re-query restricted to manual+legacy (db helper takes single sourceType)
+        const manual = getNoResultBreakdownByDomain({ sourceType: 'manual' });
+        const legacy = getNoResultBreakdownByDomain({ sourceType: 'legacy' });
+        const merged = new Map();
+        for (const r of [...manual, ...legacy]) {
+            merged.set(r.domain, (merged.get(r.domain) || 0) + r.n);
+        }
+        all = Array.from(merged, ([domain, n]) => ({ domain, n })).sort((a, b) => b.n - a.n);
+    }
+    const total = all.reduce((acc, r) => acc + r.n, 0);
+    const PAGE_SIZE = 10;
+    const slice = all.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+
+    const rows = [];
+    rows.push([{
+        text: `🌐 All Domains (${formatNum(total)})`,
+        callback_data: `nores_export:${sourceKey}:all`
+    }]);
+    for (const row of slice) {
+        const idx = registerCoverageDomain(row.domain);
+        rows.push([{
+            text: `${row.domain.slice(0, 32)} (${formatNum(row.n)})`,
+            callback_data: `nores_export:${sourceKey}:${idx}`
+        }]);
+    }
+    const navRow = [];
+    if (page > 0) navRow.push({ text: '◀ Prev', callback_data: `nores_page:${sourceKey}:${page - 1}` });
+    if ((page + 1) * PAGE_SIZE < all.length) navRow.push({ text: 'Next ▶', callback_data: `nores_page:${sourceKey}:${page + 1}` });
+    if (navRow.length > 0) rows.push(navRow);
+    rows.push([{ text: '⬅️ Back', callback_data: 'home_open:noresult_menu' }]);
+    return { inline_keyboard: rows };
+};
+
+/**
+ * Materialize a list of rows into a CSV file under
+ * `scraped data/exports/`, then send it as a Telegram document.
+ * `rows` shape depends on the helper that produced them; the column
+ * map handles both coverage and no-result shapes.
+ */
+const writeAndSendCsvExport = async (chatId, fileName, rows, columns) => {
+    const exportDir = path.join(process.cwd(), 'scraped data', 'exports');
+    if (!fs.existsSync(exportDir)) {
+        fs.mkdirSync(exportDir, { recursive: true });
+    }
+    const filePath = path.join(exportDir, fileName);
+
+    const header = columns.map(c => c.label).join(',') + '\n';
+    const body = rows.map(r =>
+        columns.map(c => escapeCsvCell(c.get(r) ?? '')).join(',')
+    ).join('\n');
+    fs.writeFileSync(filePath, header + body + '\n', 'utf8');
+
+    try {
+        await bot.sendDocument(
+            chatId,
+            filePath,
+            { caption: `📄 ${fileName}\nRows: ${rows.length}` },
+            { filename: fileName, contentType: 'text/csv' }
+        );
+    } catch (err) {
+        console.error(`CSV export send failed: ${err.message}`);
+        await sendPlainMessage(`Saved to ${filePath} but failed to send: ${err.message}`, chatId);
+    }
+};
+
+const COVERAGE_COLUMNS = [
+    { label: 'article_url',     get: r => r.url },
+    { label: 'scraped_at',      get: r => r.timestamp },
+    { label: 'domain',          get: r => r.domain },
+    { label: 'instagram_links', get: r => r.instagram_links || '' },
+    { label: 'linkedin_links',  get: r => r.linkedin_links || '' },
+    { label: 'website_links',   get: r => r.website_links || '' }
+];
+
+const NORES_COLUMNS = [
+    { label: 'article_url',  get: r => r.url },
+    { label: 'scraped_at',   get: r => r.timestamp },
+    { label: 'domain',       get: r => r.domain },
+    { label: 'source_type',  get: r => r.source_type || 'legacy' },
+    { label: 'message',      get: r => r.message || '' }
+];
 
 const formatProxyModeLabel = (mode) => {
     switch (mode) {
@@ -3443,6 +3650,126 @@ bot.on('callback_query', async (callbackQuery) => {
         const removed = purgeDoneFromQueue();
         await sendPlainMessage(`🧹 Purged ${removed} finished row(s) from the queue.`, msg.chat.id);
         await sendOrEditMenu(msg.chat.id, '🗂 Scrape Queue', buildQueueMenuKeyboard(), msg);
+        return;
+    }
+
+    /* ----- Coverage Export ------------------------------------------- */
+    if (data === 'home_open:coverage_menu') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(msg.chat.id, buildCoverageHeader(), buildCoverageMenuKeyboard(), msg);
+        return;
+    }
+    if (data.startsWith('cov_pick:')) {
+        const bucket = data.slice('cov_pick:'.length);
+        if (!COVERAGE_BUCKET_LABEL[bucket]) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Unknown bucket', show_alert: true });
+            return;
+        }
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            `🌐 Pick domain — ${COVERAGE_BUCKET_LABEL[bucket]}\n(Page Tracker URLs only)`,
+            buildCoverageDomainKeyboard(bucket, 0),
+            msg
+        );
+        return;
+    }
+    if (data.startsWith('cov_page:')) {
+        const [, bucket, pageStr] = data.split(':');
+        const page = Math.max(0, parseInt(pageStr, 10) || 0);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            `🌐 Pick domain — ${COVERAGE_BUCKET_LABEL[bucket] || bucket}`,
+            buildCoverageDomainKeyboard(bucket, page),
+            msg
+        );
+        return;
+    }
+    if (data.startsWith('cov_export:')) {
+        const [, bucket, domainToken] = data.split(':');
+        const domain = domainToken === 'all' ? null : resolveCoverageDomain(domainToken);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+
+        let rows = [];
+        const opts = { sourceType: 'page_tracker', domain };
+        if (bucket === 'ig_only') rows = getUrlsWithInstagramButNoLinkedin(opts);
+        else if (bucket === 'li_only') rows = getUrlsWithLinkedinButNoInstagram(opts);
+        else if (bucket === 'neither') rows = getUrlsWithoutAnySocial(opts);
+
+        if (rows.length === 0) {
+            await sendPlainMessage('No matching articles to export.', msg.chat.id);
+            return;
+        }
+        const datestamp = new Date().toISOString().slice(0, 10);
+        const domainSlug = domain ? domain.replace(/[^a-z0-9._-]+/gi, '_') : 'all-domains';
+        const fileName = `coverage-${bucket}-${domainSlug}-${datestamp}.csv`;
+        await sendPlainMessage(`📦 Generating ${formatNum(rows.length)}-row CSV…`, msg.chat.id);
+        await writeAndSendCsvExport(msg.chat.id, fileName, rows, COVERAGE_COLUMNS);
+        return;
+    }
+
+    /* ----- No-Result Export ------------------------------------------ */
+    if (data === 'home_open:noresult_menu') {
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(msg.chat.id, buildNoResultHeader(), buildNoResultMenuKeyboard(), msg);
+        return;
+    }
+    if (data.startsWith('nores_pick:')) {
+        const sourceKey = data.slice('nores_pick:'.length);
+        if (!['all', 'page_tracker', 'sitemap', 'manual_legacy'].includes(sourceKey)) {
+            await safeAnswerCallbackQuery(callbackQuery.id, { text: 'Unknown source', show_alert: true });
+            return;
+        }
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        const headerLabel = sourceKey === 'all' ? 'All sources'
+                          : sourceKey === 'manual_legacy' ? 'Manual / Legacy'
+                          : sourceKey.replace('_', ' ');
+        await sendOrEditMenu(
+            msg.chat.id,
+            `🌐 Pick domain — No-Result · ${headerLabel}`,
+            buildNoResultDomainKeyboard(sourceKey, 0),
+            msg
+        );
+        return;
+    }
+    if (data.startsWith('nores_page:')) {
+        const [, sourceKey, pageStr] = data.split(':');
+        const page = Math.max(0, parseInt(pageStr, 10) || 0);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+        await sendOrEditMenu(
+            msg.chat.id,
+            `🌐 Pick domain — No-Result · ${sourceKey}`,
+            buildNoResultDomainKeyboard(sourceKey, page),
+            msg
+        );
+        return;
+    }
+    if (data.startsWith('nores_export:')) {
+        const [, sourceKey, domainToken] = data.split(':');
+        const domain = domainToken === 'all' ? null : resolveCoverageDomain(domainToken);
+        await safeAnswerCallbackQuery(callbackQuery.id);
+
+        let rows = [];
+        if (sourceKey === 'manual_legacy') {
+            // Two queries, merged. Each one filters scraped_urls to status='No_Result'.
+            const a = getNoResultUrls({ sourceType: 'manual', domain });
+            const b = getNoResultUrls({ sourceType: 'legacy', domain });
+            rows = a.concat(b);
+        } else {
+            const sourceType = sourceKey === 'all' ? null : sourceKey;
+            rows = getNoResultUrls({ sourceType, domain });
+        }
+
+        if (rows.length === 0) {
+            await sendPlainMessage('No matching No-Result rows to export.', msg.chat.id);
+            return;
+        }
+        const datestamp = new Date().toISOString().slice(0, 10);
+        const domainSlug = domain ? domain.replace(/[^a-z0-9._-]+/gi, '_') : 'all-domains';
+        const fileName = `no-result-${sourceKey}-${domainSlug}-${datestamp}.csv`;
+        await sendPlainMessage(`📦 Generating ${formatNum(rows.length)}-row CSV…`, msg.chat.id);
+        await writeAndSendCsvExport(msg.chat.id, fileName, rows, NORES_COLUMNS);
         return;
     }
 
