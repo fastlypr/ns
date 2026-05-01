@@ -61,7 +61,16 @@ import {
     urlExists,
     removeQueuedUrl,
     DB_FILE_PATH,
-    closeDatabase
+    closeDatabase,
+    backfillScrapedUrlsDomain,
+    getCoverageSummary,
+    getUrlsWithInstagramButNoLinkedin,
+    getUrlsWithLinkedinButNoInstagram,
+    getUrlsWithoutAnySocial,
+    getCoverageBreakdownByDomain,
+    getNoResultSummary,
+    getNoResultBreakdownByDomain,
+    getNoResultUrls
 } from './db.js';
 
 // Utility function to escape MarkdownV2 special characters
@@ -1471,6 +1480,17 @@ try {
 } catch (err) {
     console.error(`Queue startup cleanup failed: ${err.message}`);
 }
+// One-shot domain backfill: stamp scraped_urls.domain for legacy rows
+// (added in the source-aware exports feature). With ~500k rows this
+// runs in a few seconds and is a no-op on subsequent boots.
+try {
+    const { updated } = backfillScrapedUrlsDomain();
+    if (updated > 0) {
+        console.log(`🧹 Domain backfill: stamped domain on ${updated} scraped_urls row(s).`);
+    }
+} catch (err) {
+    console.error(`Domain backfill failed: ${err.message}`);
+}
 startDownloadServer();
 bot.setMyCommands(BOT_COMMANDS).catch(error => {
     console.error(`Failed to set Telegram bot commands: ${error.message}`);
@@ -2048,7 +2068,7 @@ const runTrackedFolderScrape = async (chatId, toScrapeDir) => {
     await sendPlainMessage(summaryHeader ? `${summaryHeader}\n${summaryText}` : summaryText, chatId);
 };
 
-const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
+const runTrackedUrlListScrape = async (chatId, label, urls, force = false, sourceType = null) => {
     const initialSummary = {
         totalUrls: urls.length,
         processedUrls: 0,
@@ -2082,6 +2102,7 @@ const runTrackedUrlListScrape = async (chatId, label, urls, force = false) => {
 
     const summary = await runScraper(urls, null, force, {
         signal: getCurrentAbortSignal(),
+        sourceType,
         onProgress: async (progress) => {
             await updateTracker(progress, progress.stage === 'start' || progress.stage === 'complete');
         }
@@ -2986,7 +3007,7 @@ bot.on('message', auth(async (msg) => {
     clearPendingChatInput(msg.chat.id);
 
     await withBotStatus('scraping', `telegram_input:${urls.length}`, async () => {
-        await runTrackedUrlListScrape(msg.chat.id, 'Telegram Input', urls);
+        await runTrackedUrlListScrape(msg.chat.id, 'Telegram Input', urls, false, 'manual');
     });
 }));
 

@@ -942,7 +942,7 @@ function removeLineFromFile(filePath, urlToRemove) {
  */
 export async function runScraper(urls, sourceFilePath = null, force = false, options = {}) {
     ensureScraperInitialized();
-    const { onProgress, signal } = options;
+    const { onProgress, signal, sourceType = null } = options;
     const startedAt = Date.now();
     const linkedinLeadSet = new Set();
     const instagramLeadSet = new Set();
@@ -1016,7 +1016,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
         }
         
         if (result.error) {
-            logScrapeResult(url, 'Failed', result.error);
+            logScrapeResult(url, 'Failed', result.error, 0, sourceType);
             markQueueFailed(url);
             console.log(`❌ Failed: ${url} (${result.error})`);
             progress.processedUrls++;
@@ -1046,7 +1046,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
             progress.instagramLeadCount = instagramLeadSet.size;
             progress.linkedinLeadKeys = Array.from(linkedinLeadSet);
             progress.instagramLeadKeys = Array.from(instagramLeadSet);
-            logScrapeResult(url, 'Success', `Found ${result.socials.length} links`);
+            logScrapeResult(url, 'Success', `Found ${result.socials.length} links`, 0, sourceType);
             markQueueDone(url);
             console.log(`✅ Found ${result.socials.length} links:`);
             result.socials.forEach(item => {
@@ -1059,7 +1059,7 @@ export async function runScraper(urls, sourceFilePath = null, force = false, opt
             progress.successCount++;
             await emitProgress('progress', { currentUrl: url, lastStatus: 'Success' });
         } else {
-            logScrapeResult(url, 'No_Result', 'No links found');
+            logScrapeResult(url, 'No_Result', 'No links found', 0, sourceType);
             markQueueDone(url);
             console.log('⚠️  No links found (Marked as No Result).');
             progress.processedUrls++;

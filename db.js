@@ -111,8 +111,66 @@ try {
     // Columns likely already exist
 }
 
+// Migration: add source_type column to scraped_urls and queued_urls.
+// Tags how a URL was originally discovered ('page_tracker' | 'sitemap' |
+// 'manual' | 'legacy'). Powers the source-aware coverage / no-result
+// exports added on top of this. Existing rows backfill to 'legacy'
+// because we can't reverse-engineer their origin from history alone.
+try {
+    const sCols = db.prepare("PRAGMA table_info(scraped_urls)").all();
+    if (!sCols.some(c => c.name === 'source_type')) {
+        db.exec("ALTER TABLE scraped_urls ADD COLUMN source_type TEXT NOT NULL DEFAULT 'legacy'");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_scraped_urls_source_type ON scraped_urls(source_type)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_scraped_urls_status_source ON scraped_urls(status, source_type)");
+
+    const qCols2 = db.prepare("PRAGMA table_info(queued_urls)").all();
+    if (!qCols2.some(c => c.name === 'source_type')) {
+        db.exec("ALTER TABLE queued_urls ADD COLUMN source_type TEXT");
+    }
+} catch (e) {
+    // Column likely already exists
+}
+
+// Migration: add domain column to scraped_urls so coverage / no-result
+// exports can filter by domain efficiently. Backfilled at startup
+// (see backfillScrapedUrlsDomain below). With ~500k+ rows this is a
+// one-shot cost; afterwards every domain query is index-driven.
+try {
+    const sCols = db.prepare("PRAGMA table_info(scraped_urls)").all();
+    if (!sCols.some(c => c.name === 'domain')) {
+        db.exec("ALTER TABLE scraped_urls ADD COLUMN domain TEXT");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_scraped_urls_domain ON scraped_urls(domain)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_scraped_urls_status_domain ON scraped_urls(status, domain)");
+} catch (e) {
+    // Column likely already exists
+}
+
+// Performance: the Coverage Export EXISTS / NOT EXISTS checks join
+// social_leads on (source_url, platform). This index turns each
+// check from O(n) full-table scan into O(log n).
+try {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_social_leads_source_url_platform ON social_leads(source_url, platform)");
+} catch (e) {
+    // Index likely already exists
+}
+
 // Prepared Statements for Speed
-const insertStmt = db.prepare('INSERT OR REPLACE INTO scraped_urls (url, status, message, timestamp, no_unique_profile) VALUES (?, ?, ?, ?, ?)');
+// NB: when REPLACE-ing an existing row we must NOT clobber a known
+// source_type / domain with NULL. The two upsert paths below preserve
+// any existing values via COALESCE.
+const insertStmt = db.prepare(`
+    INSERT INTO scraped_urls (url, status, message, timestamp, no_unique_profile, source_type, domain)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(url) DO UPDATE SET
+        status = excluded.status,
+        message = excluded.message,
+        timestamp = excluded.timestamp,
+        no_unique_profile = excluded.no_unique_profile,
+        source_type = COALESCE(scraped_urls.source_type, excluded.source_type, 'legacy'),
+        domain = COALESCE(scraped_urls.domain, excluded.domain)
+`);
 const insertSitemapStmt = db.prepare('INSERT OR IGNORE INTO discovered_sitemaps (url, parent_url, last_scanned) VALUES (?, ?, ?)');
 const getAllSitemapsStmt = db.prepare('SELECT url FROM discovered_sitemaps');
 const updateSitemapDateStmt = db.prepare('UPDATE discovered_sitemaps SET last_scanned = ? WHERE url = ?');
@@ -122,12 +180,13 @@ const getAllScrapedUrlsStmt = db.prepare('SELECT url FROM scraped_urls');
 const getAllQueuedUrlsStmt = db.prepare('SELECT url FROM queued_urls');
 const deleteQueuedUrlStmt = db.prepare('DELETE FROM queued_urls WHERE url = ?');
 const upsertQueuedUrlStmt = db.prepare(`
-    INSERT INTO queued_urls (url, source, batch_id, status, discovered_at, updated_at)
-    VALUES (?, ?, ?, 'Queued', ?, ?)
+    INSERT INTO queued_urls (url, source, batch_id, status, source_type, discovered_at, updated_at)
+    VALUES (?, ?, ?, 'Queued', ?, ?, ?)
     ON CONFLICT(url) DO UPDATE SET
         source = excluded.source,
         batch_id = COALESCE(excluded.batch_id, queued_urls.batch_id),
         status = CASE WHEN queued_urls.status = 'Done' THEN queued_urls.status ELSE 'Queued' END,
+        source_type = COALESCE(queued_urls.source_type, excluded.source_type),
         updated_at = excluded.updated_at
 `);
 const getQueuedByBatchStmt = db.prepare(`
@@ -367,18 +426,81 @@ export function urlExists(url) {
 }
 
 /**
- * Logs a scraping result.
- * @param {string} url 
- * @param {string} status 
- * @param {string} message 
- * @param {number} profileCount - Number of unique profiles found (optional)
+ * Extract the bare domain from a URL ('https://www.foo.com/x' -> 'foo.com').
+ * Lowercased and stripped of `www.` so it matches what social_leads.domain
+ * stores (and what the user types in filters).
  */
-export function logScrapeResult(url, status, message, profileCount = 0) {
+export function extractDomain(url) {
+    try {
+        const u = new URL(url);
+        return u.hostname.toLowerCase().replace(/^www\./, '') || null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Look up an existing scraped_urls row's source_type so subsequent
+ * writes preserve it. Returns null if the row doesn't exist yet.
+ */
+const getSourceTypeStmt = db.prepare('SELECT source_type FROM scraped_urls WHERE url = ?');
+
+/**
+ * Look up the queued_urls row's source_type for a URL — used by the
+ * scraper worker when it doesn't know the source itself (e.g. when a
+ * "Run All" picks up a URL that was queued by RSS/page-tracker hours
+ * earlier).
+ */
+const getQueuedSourceTypeStmt = db.prepare('SELECT source_type FROM queued_urls WHERE url = ?');
+
+/**
+ * Logs a scraping result.
+ *
+ * @param {string} url
+ * @param {string} status
+ * @param {string} message
+ * @param {number} [profileCount=0]
+ * @param {string} [sourceType] — 'page_tracker' | 'sitemap' | 'manual'
+ *                                (defaults to looking up the queue row,
+ *                                falling back to 'manual')
+ */
+export function logScrapeResult(url, status, message, profileCount = 0, sourceType = null) {
     if (!url) return;
     const normalized = normalizeUrl(url);
     const normalizedStatus = normalizeStatus(status);
+    const domain = extractDomain(normalized);
+
+    // Resolve source_type with this priority:
+    //   1. Caller-provided sourceType (most authoritative)
+    //   2. Existing scraped_urls.source_type if this URL was scraped before
+    //      (don't downgrade a 'page_tracker' row to 'manual' on rescrape)
+    //   3. queued_urls.source_type if URL came from the queue
+    //   4. 'manual' fallback
+    let resolvedSource = sourceType;
+    if (!resolvedSource) {
+        const existing = getSourceTypeStmt.get(normalized);
+        if (existing?.source_type && existing.source_type !== 'legacy') {
+            resolvedSource = existing.source_type;
+        }
+    }
+    if (!resolvedSource) {
+        const queued = getQueuedSourceTypeStmt.get(normalized);
+        if (queued?.source_type) {
+            resolvedSource = queued.source_type;
+        }
+    }
+    if (!resolvedSource) resolvedSource = 'manual';
+
     try {
-        insertStmt.run(normalized, normalizedStatus || status, message, new Date().toISOString(), profileCount);
+        insertStmt.run(
+            normalized,
+            normalizedStatus || status,
+            message,
+            new Date().toISOString(),
+            profileCount,
+            resolvedSource,
+            domain
+        );
     } catch (err) {
         console.error(`Database Error (Log): ${err.message}`);
     }
@@ -412,14 +534,38 @@ export function makeBatchId(source = 'unknown', identifier = '') {
 }
 
 /**
+ * Map a free-form `source` string to one of our four canonical
+ * source_type tags. Used as a fallback when the caller hasn't
+ * explicitly passed `sourceType`.
+ *
+ *   page:*, rss:*           -> 'page_tracker'
+ *   xml_*, sitemap:*        -> 'sitemap'
+ *   file:*, paste:*, manual -> 'manual'
+ *   anything else           -> 'manual'
+ */
+export function inferSourceType(source) {
+    const s = String(source || '').toLowerCase();
+    if (s.startsWith('page:') || s.startsWith('rss:') || s.startsWith('page_tracker')) {
+        return 'page_tracker';
+    }
+    if (s.startsWith('xml') || s.startsWith('sitemap')) {
+        return 'sitemap';
+    }
+    return 'manual';
+}
+
+/**
  * Enqueue URLs into the work queue. Deduplicates within the input and against
  * any existing rows (existing rows stay 'Done' if already scraped, otherwise reset to 'Queued').
+ *
  * @param {string[]} urls
- * @param {{ source?: string, batchId?: string }} [opts]
- * @returns {{ inserted: number, batchId: string }}
+ * @param {{ source?: string, batchId?: string, sourceType?: string }} [opts]
+ *        sourceType defaults to inferring from `source` (see inferSourceType).
+ * @returns {{ inserted: number, batchId: string, skippedAlreadyScraped: number }}
  */
-export function enqueueUrls(urls, { source = 'unknown', batchId = null } = {}) {
+export function enqueueUrls(urls, { source = 'unknown', batchId = null, sourceType = null } = {}) {
     const normalizedSource = String(source || 'unknown').trim() || 'unknown';
+    const resolvedSourceType = sourceType || inferSourceType(normalizedSource);
     const bid = batchId || makeBatchId(normalizedSource);
     const now = new Date().toISOString();
     const uniqueUrls = Array.from(new Set(
@@ -444,7 +590,7 @@ export function enqueueUrls(urls, { source = 'unknown', batchId = null } = {}) {
 
     const tx = db.transaction((rows) => {
         for (const url of rows) {
-            upsertQueuedUrlStmt.run(url, normalizedSource, bid, now, now);
+            upsertQueuedUrlStmt.run(url, normalizedSource, bid, resolvedSourceType, now, now);
         }
     });
 
@@ -1001,7 +1147,7 @@ export function migrateCsvToDb() {
 
         const insertMany = db.transaction((rows) => {
             for (const row of rows) {
-                insertStmt.run(row.url, row.status, row.message, row.timestamp, 0);
+                insertStmt.run(row.url, row.status, row.message, row.timestamp, 0, 'legacy', extractDomain(row.url));
             }
         });
 
@@ -1054,7 +1200,7 @@ export function migrateCsvToDb() {
  */
 export function deduplicateUrls() {
     // console.log('🧹 Checking for duplicate URLs...');
-    const allUrlsStmt = db.prepare('SELECT url, status, message, timestamp, no_unique_profile FROM scraped_urls');
+    const allUrlsStmt = db.prepare('SELECT url, status, message, timestamp, no_unique_profile, source_type FROM scraped_urls');
     const deleteStmt = db.prepare('DELETE FROM scraped_urls WHERE url = ?');
     
     try {
@@ -1137,7 +1283,15 @@ export function deduplicateUrls() {
                     // If we rename, we delete old first to avoid PK conflict (though old might have been deleted if it was in deletions list?? No, logic separates them)
                     // If 'oldUrl' was a winner, it is NOT in deletions.
                     deleteStmt.run(up.oldUrl);
-                    insertStmt.run(up.newUrl, up.data.status, up.data.message, up.data.timestamp, up.data.no_unique_profile);
+                    insertStmt.run(
+                        up.newUrl,
+                        up.data.status,
+                        up.data.message,
+                        up.data.timestamp,
+                        up.data.no_unique_profile,
+                        up.data.source_type || 'legacy',
+                        extractDomain(up.newUrl)
+                    );
                 }
             });
             
@@ -1158,5 +1312,285 @@ if (count === 0) {
 
 // Always check for duplicates/normalization on startup
 deduplicateUrls();
+
+/* ====================================================================== *
+ *  Source-aware Coverage & No-Result Exports
+ * ====================================================================== *
+ * Powers the Telegram menus that let the user pull lists of URLs by
+ * (source_type × domain × coverage bucket).
+ *
+ * Source filtering:
+ *   - 'page_tracker': URLs the bot discovered itself via RSS/HTML/JSON
+ *      sources. Manageable in size, worth manually enriching.
+ *   - 'sitemap': URLs from XML sitemap scans. Often >100k; we expose a
+ *      no-result-only export so users can spot-check failures by domain.
+ *   - 'manual': URLs the user typed/pasted/uploaded.
+ *   - 'legacy': pre-existing rows from before source tagging was added.
+ *      Treated like 'sitemap' for export purposes (assumed bulk).
+ *
+ * IMPORTANT: numbers in the UI must reconcile back to /stats. Every
+ * helper here filters scraped_urls.status='Success' (for coverage) or
+ * 'No_Result' (for no-result), so the buckets visibly sum to the
+ * stats total minus 'Failed'.
+ * ====================================================================== */
+
+/**
+ * One-shot startup backfill: populate `scraped_urls.domain` for any rows
+ * inserted before the column existed. Safe to run repeatedly — it only
+ * touches rows where domain IS NULL. Logs how many were updated.
+ */
+export function backfillScrapedUrlsDomain() {
+    try {
+        const need = db.prepare("SELECT COUNT(*) AS n FROM scraped_urls WHERE domain IS NULL").get();
+        if (!need || need.n === 0) return { updated: 0 };
+
+        const rows = db.prepare("SELECT url FROM scraped_urls WHERE domain IS NULL").all();
+        const upd = db.prepare("UPDATE scraped_urls SET domain = ? WHERE url = ?");
+        const tx = db.transaction((items) => {
+            for (const r of items) {
+                upd.run(extractDomain(r.url), r.url);
+            }
+        });
+        tx(rows);
+        return { updated: rows.length };
+    } catch (err) {
+        console.error(`Domain backfill failed: ${err.message}`);
+        return { updated: 0 };
+    }
+}
+
+/**
+ * Coverage summary for a given source_type filter (or all sources).
+ *   total_success        rows where status='Success'
+ *   ig_only              has Instagram lead, no LinkedIn lead
+ *   li_only              has LinkedIn lead, no Instagram lead
+ *   both                 has both
+ *   neither              no IG, no LI (may have website-only or nothing)
+ *
+ * Buckets sum to total_success.
+ *
+ * @param {{ sourceType?: string|null }} [opts]
+ *        sourceType: 'page_tracker' | 'sitemap' | 'manual' | null=all
+ */
+export function getCoverageSummary({ sourceType = null } = {}) {
+    const whereSource = sourceType ? `AND s.source_type = '${sourceType.replace(/'/g, "''")}'` : '';
+    const sql = `
+        SELECT
+            (SELECT COUNT(*) FROM scraped_urls s
+                WHERE s.status='Success' ${whereSource}) AS total_success,
+            (SELECT COUNT(*) FROM scraped_urls s
+                WHERE s.status='Success' ${whereSource}
+                  AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='instagram')
+                  AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='linkedin')
+            ) AS ig_only,
+            (SELECT COUNT(*) FROM scraped_urls s
+                WHERE s.status='Success' ${whereSource}
+                  AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='linkedin')
+                  AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='instagram')
+            ) AS li_only,
+            (SELECT COUNT(*) FROM scraped_urls s
+                WHERE s.status='Success' ${whereSource}
+                  AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='instagram')
+                  AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='linkedin')
+            ) AS both,
+            (SELECT COUNT(*) FROM scraped_urls s
+                WHERE s.status='Success' ${whereSource}
+                  AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform IN ('instagram','linkedin'))
+            ) AS neither
+    `;
+    try {
+        return db.prepare(sql).get();
+    } catch (err) {
+        console.error(`Coverage summary failed: ${err.message}`);
+        return { total_success: 0, ig_only: 0, li_only: 0, both: 0, neither: 0 };
+    }
+}
+
+/**
+ * Internal helper that runs a coverage query and returns rows enriched
+ * with concatenated link lists. The `bucket` arg picks one of:
+ *   'ig_only' | 'li_only' | 'neither' | 'both'
+ */
+function runCoverageQuery(bucket, { sourceType = null, domain = null } = {}) {
+    const whereSource = sourceType ? `AND s.source_type = ?` : '';
+    const whereDomain = domain ? `AND s.domain = ?` : '';
+    const params = [];
+    if (sourceType) params.push(sourceType);
+    if (domain) params.push(domain);
+
+    let bucketWhere = '';
+    switch (bucket) {
+        case 'ig_only':
+            bucketWhere = `
+                AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='instagram')
+                AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='linkedin')
+            `;
+            break;
+        case 'li_only':
+            bucketWhere = `
+                AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='linkedin')
+                AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='instagram')
+            `;
+            break;
+        case 'both':
+            bucketWhere = `
+                AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='instagram')
+                AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='linkedin')
+            `;
+            break;
+        case 'neither':
+            bucketWhere = `
+                AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform IN ('instagram','linkedin'))
+            `;
+            break;
+        default:
+            return [];
+    }
+
+    const sql = `
+        SELECT
+            s.url,
+            s.timestamp,
+            s.domain,
+            s.source_type,
+            (SELECT GROUP_CONCAT(social_link, '|')
+                FROM social_leads WHERE source_url=s.url AND platform='instagram') AS instagram_links,
+            (SELECT GROUP_CONCAT(social_link, '|')
+                FROM social_leads WHERE source_url=s.url AND platform='linkedin') AS linkedin_links,
+            (SELECT GROUP_CONCAT(social_link, '|')
+                FROM social_leads WHERE source_url=s.url AND platform='website') AS website_links
+        FROM scraped_urls s
+        WHERE s.status = 'Success'
+          ${whereSource}
+          ${whereDomain}
+          ${bucketWhere}
+        ORDER BY s.timestamp DESC
+    `;
+    try {
+        return db.prepare(sql).all(...params);
+    } catch (err) {
+        console.error(`Coverage query (${bucket}) failed: ${err.message}`);
+        return [];
+    }
+}
+
+export const getUrlsWithInstagramButNoLinkedin = (opts = {}) => runCoverageQuery('ig_only', opts);
+export const getUrlsWithLinkedinButNoInstagram = (opts = {}) => runCoverageQuery('li_only', opts);
+export const getUrlsWithoutAnySocial           = (opts = {}) => runCoverageQuery('neither', opts);
+
+/**
+ * Domain breakdown for a coverage bucket. Used to render the Step-2
+ * domain selector menu. Sorted by count DESC so the worst-offending
+ * domains are at the top.
+ */
+export function getCoverageBreakdownByDomain(bucket, { sourceType = null } = {}) {
+    const whereSource = sourceType ? `AND s.source_type = ?` : '';
+    const params = sourceType ? [sourceType] : [];
+
+    let bucketWhere = '';
+    switch (bucket) {
+        case 'ig_only':
+            bucketWhere = `
+                AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='instagram')
+                AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='linkedin')
+            `;
+            break;
+        case 'li_only':
+            bucketWhere = `
+                AND EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='linkedin')
+                AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform='instagram')
+            `;
+            break;
+        case 'neither':
+            bucketWhere = `
+                AND NOT EXISTS (SELECT 1 FROM social_leads sl WHERE sl.source_url=s.url AND sl.platform IN ('instagram','linkedin'))
+            `;
+            break;
+        default:
+            return [];
+    }
+    const sql = `
+        SELECT s.domain, COUNT(*) AS n
+        FROM scraped_urls s
+        WHERE s.status='Success'
+          AND s.domain IS NOT NULL
+          ${whereSource}
+          ${bucketWhere}
+        GROUP BY s.domain
+        ORDER BY n DESC
+    `;
+    try {
+        return db.prepare(sql).all(...params);
+    } catch (err) {
+        console.error(`Coverage breakdown failed: ${err.message}`);
+        return [];
+    }
+}
+
+/**
+ * Source-tagged No-Result counts. Used to render the No-Result Export
+ * top-level menu. Buckets sum to total_no_result.
+ */
+export function getNoResultSummary() {
+    try {
+        const total = db.prepare("SELECT COUNT(*) AS n FROM scraped_urls WHERE status='No_Result'").get();
+        const bySource = db.prepare(`
+            SELECT COALESCE(source_type, 'legacy') AS source_type, COUNT(*) AS n
+            FROM scraped_urls
+            WHERE status='No_Result'
+            GROUP BY source_type
+        `).all();
+        const out = { total: total?.n || 0, page_tracker: 0, sitemap: 0, manual: 0, legacy: 0 };
+        for (const row of bySource) {
+            out[row.source_type] = row.n;
+        }
+        return out;
+    } catch (err) {
+        console.error(`No-result summary failed: ${err.message}`);
+        return { total: 0, page_tracker: 0, sitemap: 0, manual: 0, legacy: 0 };
+    }
+}
+
+/**
+ * Domain breakdown for No-Result, optionally scoped to one source_type.
+ * `null` source means "all sources combined".
+ */
+export function getNoResultBreakdownByDomain({ sourceType = null } = {}) {
+    const whereSource = sourceType ? `AND source_type = ?` : '';
+    const params = sourceType ? [sourceType] : [];
+    const sql = `
+        SELECT domain, COUNT(*) AS n
+        FROM scraped_urls
+        WHERE status='No_Result' AND domain IS NOT NULL ${whereSource}
+        GROUP BY domain
+        ORDER BY n DESC
+    `;
+    try {
+        return db.prepare(sql).all(...params);
+    } catch (err) {
+        console.error(`No-result breakdown failed: ${err.message}`);
+        return [];
+    }
+}
+
+/** No-Result URLs filtered by source and/or domain. */
+export function getNoResultUrls({ sourceType = null, domain = null } = {}) {
+    const where = ["status='No_Result'"];
+    const params = [];
+    if (sourceType) { where.push('source_type = ?'); params.push(sourceType); }
+    if (domain)     { where.push('domain = ?');      params.push(domain); }
+    const sql = `
+        SELECT url, timestamp, domain, source_type, message
+        FROM scraped_urls
+        WHERE ${where.join(' AND ')}
+        ORDER BY timestamp DESC
+    `;
+    try {
+        return db.prepare(sql).all(...params);
+    } catch (err) {
+        console.error(`No-result query failed: ${err.message}`);
+        return [];
+    }
+}
 
 export default db;
